@@ -1,0 +1,113 @@
+# What this bot may move, and what it only reports.
+#
+# The manifest is the source of truth for the pins themselves; this file is the source of truth
+# for HOW each one is allowed to advance. Every pinned source in the manifest must appear here:
+# a source with no rule stops the run, because a pin nobody wrote a rule for is a pin nobody
+# decided to automate.
+#
+#   track = "tip"      follow the declared branch's tip
+#   track = "tag"      follow the newest version-shaped tag on that branch (v1.2.3, 1.5.2, v112)
+#   track = "release"  follow the newest GitHub release that is neither a draft nor a prerelease
+#   track = "manual"   REPORT only — never moved by this bot
+#
+# A move is only ever forward and only ever on the declared branch: the candidate must be a
+# descendant of the current pin and an ancestor of the branch tip. Anything else is reported as
+# a fault, never applied.
+
+[source."src/loraham-daemon"]
+track = "manual"
+why = "the real daemon needs a radio to start; the test lab cannot prove it, so it moves by hand with the box test matrix"
+
+# READINESS REHEARSAL 2026-09-10 — restore to `track = "manual"` when it ends.
+[source."src/LoRaHAM_Daemon"]
+track = "manual"
+why = "the same upstream repository as src/loraham-daemon (chat builds from it); moving one without the other would put two commits of one repo in the manifest"
+
+[source."src/RadioLib"]
+track = "manual"
+why = "compiled into the daemon; proved only where the daemon is proved"
+
+[source."src/LoRaHAM_Voice"]
+track = "tip"
+
+[source."src/loraham-kiss-tnc"]
+track = "tip"
+
+[source."src/meshcom-loraham-bridge"]
+track = "tip"
+
+[source."src/meshcom-qemu-raspi"]
+track = "tip"
+
+[source."src/MeshCom-Firmware"]
+track = "tip"
+why = "upstream develops on `dev`; its tags lag the branch by design"
+
+[source."src/openhop-core"]
+track = "tip"
+why = "openHop's `dev` is the active line; `main` carries the PyPI releases and is not equivalent"
+
+[source."src/openhop-repeater"]
+track = "tip"
+
+[source."src/meshcore-webui"]
+track = "tip"
+why = "no tags upstream"
+
+[source."src/meshcore-cli"]
+track = "tag"
+
+[source."src/loraham-rns-interface"]
+track = "tip"
+
+[source."src/meshtastic-firmware"]
+track = "release"
+why = "v2.8.x are prereleases; the known-working line follows the newest STABLE release"
+
+[source."src/reticulum"]
+track = "tag"
+
+[source."src/nomadnet"]
+track = "tip"
+why = "the manifest pins it at the branch tip, not at a release: its pin_tag is a describe-style short sha (`ad10301`) where every tag-tracked source carries a version (`1.5.2`, `v1.6.3`, `2.1.0`), and the newest tag 1.2.0 points at an OLDER commit. Tag tracking would move this pin backwards"
+
+[source."src/lxmf"]
+track = "tag"
+
+[source."src/sideband"]
+track = "tag"
+
+# Pinned inputs that are not git sources. Each one is named here so a summary can state its
+# status instead of implying the git list is the whole inventory.
+# Any automatically tracked entry above or below may carry one more key:
+#
+#   freeze = "Upstream startup regression; hold the tested revision until the fix is verified."
+#
+# It holds that input at whatever the manifest pins today while everything else keeps moving. The
+# value is the REASON and must be a nonblank string — a bare flag says nothing a maintainer could
+# act on months later. Delete the line to thaw; there is no expiry, because elapsed time is not
+# evidence that an upstream problem is fixed. A hold on a `manual` or an `owned-by-pin` entry is
+# refused: it would read as though it were doing something while it held nothing.
+
+[extra.graywolf]
+kind = "github-release"
+repo = "chrissnell/graywolf"
+track = "release"
+why = "the manifest names the version literally and the fetch script carries its sha256 table"
+
+[extra.meshtastic-web]
+kind = "github-release"
+repo = "meshtastic/web"
+track = "release"
+why = "the manifest names the release and the sha256 of its build.tar; moving it FORCES a meshtastic binary republish, because the client ships inside that artifact"
+
+[extra.meshtastic-cli]
+kind = "pypi"
+package = "meshtastic"
+track = "release"
+why = "a pip version in a build step; the venv is built on the box, but the VERSION is recorded in the completion marker the artifact ships, so moving it forces a meshtastic republish too"
+
+[extra.qemu-esp]
+kind = "owned-by-pin"
+owner = "src/meshcom-qemu-raspi"
+why = "the Espressif QEMU tag lives in that pinned repository's own scripts, so its pin moves with it"

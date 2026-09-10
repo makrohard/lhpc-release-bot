@@ -1,0 +1,298 @@
+# The scheduled pin release, one job per stage.
+#
+# The stages are separate jobs because each waits on somebody else's build: a hosted job is
+# capped at six hours, and one job holding all the waits would run out before it could clean up
+# after itself. What crosses between them is not job state but the ATTEMPT ISSUE in this
+# repository — an issue outlives the run, can be written even when the release token is what
+# failed, and is what a later run reads to find out whether anything is still owed.
+#
+# Nothing is published until every stage before it is green, and the one moment that cannot be
+# undone (the controller's `main` and its tag, pushed together) comes after the proof.
+name: release
+
+run-name: "release (${{ inputs.mode || 'full' }})"
+
+on:
+  schedule:
+    # Mondays, 21:30 UTC. A cron in the source is NOT evidence that scheduled publishing is off:
+    # the workflow is enabled server-side and this event fires whether or not anybody wants it
+    # to. So the schedule is gated below on the repository variable `SCHEDULE_ENABLED`, which is
+    # visible here rather than in a setting nobody reads. Manual dispatch is unaffected.
+    - cron: '30 21 * * 1' 
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "what to do"
+        type: choice
+        default: full
+        options: [full, watch-only, dry-run, finish, recover]
+      attempt:
+        description: "for finish / recover: the run id of the attempt to finish or undo"
+        required: false
+        default: ""
+      retry_of:
+        description: "set by an automatic freeze on the ONE retry it dispatches; not for manual use"
+        required: false
+        default: ""
+      retry_incident:
+        description: "the auto-freeze incident that retry answers for; set with retry_of"
+        required: false
+        default: ""
+      lhpc_ref:
+        description: "REHEARSAL ONLY: controller ref to base the attempt on; empty = main"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write               # the attempt record and the failure report live here
+
+concurrency:
+  group: release
+  cancel-in-progress: false   # never cancel a run that may have published something
+
+env:
+  MODE: ${{ inputs.mode || 'full' }}
+  RETRY_OF: ${{ inputs.retry_of }}
+  RETRY_INCIDENT: ${{ inputs.retry_incident }}
+  # Empty for every real release: the plan then bases the attempt on `main`. The release stage
+  # pushes to `main` regardless and refuses when `main` is not the commit it captured, so a run
+  # based on anything else can prove a freeze and can never publish.
+  LHPC_REF: ${{ inputs.lhpc_ref }}
+  AUTO_RELEASE_TOKEN: ${{ secrets.AUTO_RELEASE_TOKEN }}
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  plan:
+    # Access, an unresolved earlier attempt, upstream, the edit, the candidate branch. Every
+    # reason to stop that costs nothing to find is found here, before anything is published.
+    # The schedule does nothing until `SCHEDULE_ENABLED` is set to `true` in this repository's
+    # variables. Until then a scheduled run starts, finds the gate closed, and stops having
+    # changed nothing — which is a state anybody can read off this file.
+    if: >-
+      ${{ (github.event_name != 'schedule' || vars.SCHEDULE_ENABLED == 'true')
+      && ((inputs.mode || 'full') == 'full' || inputs.mode == 'watch-only'
+      || inputs.mode == 'dry-run') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      proceed: ${{ steps.plan.outputs.proceed }}
+      version: ${{ steps.plan.outputs.version }}
+      candidate: ${{ steps.plan.outputs.candidate }}
+      branch: ${{ steps.plan.outputs.branch }}
+      binary_stacks: ${{ steps.plan.outputs.binary_stacks }}
+      binary_stacks_json: ${{ steps.plan.outputs.binary_stacks_json }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - id: plan
+        run: python -m bot.cli plan
+
+  build:
+    # The first change to the world outside this repository. ONE STACK PER JOB: each gets its
+    # own time bound, so two stacks cannot between them outlast a hosted job's six-hour ceiling
+    # and leave the run unable to clean up after itself. `max-parallel: 1` keeps the publisher's
+    # serialization and keeps a failure attributable to one entry.
+    needs: plan
+    if: ${{ needs.plan.outputs.proceed == 'true' && needs.plan.outputs.binary_stacks != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        stack: ${{ fromJSON(needs.plan.outputs.binary_stacks_json) }}
+    env:
+      BINARY_STACK: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli build
+
+  prove:
+    needs: [plan, build]
+    if: ${{ always() && needs.plan.outputs.proceed == 'true' && needs.build.result != 'failure' && needs.build.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli prove
+
+  release:
+    # THE COMMIT POINT. After this job succeeds the controller release exists and boxes will
+    # self-update to it; nothing downstream may roll its binaries back.
+    # `always()` is REQUIRED, not decoration: a skipped job skips everything downstream of it,
+    # and `build` is skipped whenever no binary-covered pin moved. Without it a perfectly green
+    # proof silently released nothing.
+    needs: [plan, prove]
+    if: ${{ always() && needs.plan.outputs.proceed == 'true' && needs.prove.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli release
+
+  integrate:
+    # Bringing the patch back to `dev` is not part of the release: its failure leaves an open
+    # pull request, never an unreleased controller. It runs BEFORE the image rather than beside
+    # it, because both write the same attempt record and the later writer would erase the
+    # earlier one's note.
+    needs: [plan, release]
+    # `!cancelled()`, not a bare expression. A plain `if` keeps GitHub's implicit `success()`,
+    # which propagates a SKIP down the whole chain — and `build` is skipped on every release that
+    # moves no binary-covered pin. v0.3.14 released, the image was cut, and `dev` was silently
+    # left behind because this job never ran. Not `always()` either: a cancelled run must not
+    # fast-forward `dev` behind the operator's back.
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli integrate
+
+  image:
+    needs: [plan, release, integrate]
+    # `!cancelled()` rather than `always()`. Both survive a SKIPPED integrate, which is what this
+    # needs; only `always()` also runs when the operator cancelled the run, and a cancelled
+    # release must not go on to cut an image. The attempt then records the image as owed and
+    # `finish` repairs it.
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli image
+
+  finalize:
+    # The ONE place an attempt is closed. Neither the image nor the integration may decide the
+    # attempt is finished: an image that succeeded would otherwise close over a failed
+    # integration, and the repair path could never find it again.
+    needs: [plan, release, integrate, image]
+    # Not `always()`: closing an attempt is the one thing a CANCELLED run must never do. An
+    # operator who stops a run wants what it did left visible and repairable, not tidied away.
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli finalize
+
+  recover:
+    # Runs when a stage BEFORE the commit point failed, and for an explicit `recover` dispatch.
+    # It re-reads `main` and the tag first: a missing checkpoint never proves a push did not
+    # happen, and rolling binaries back under a released controller would break every box.
+    needs: [plan, build, prove, release]
+    if: >-
+      ${{ always() && (inputs.mode == 'recover'
+      || needs.plan.result == 'failure' || needs.plan.result == 'cancelled'
+      || needs.build.result == 'failure' || needs.build.result == 'cancelled'
+      || needs.prove.result == 'failure' || needs.prove.result == 'cancelled'
+      || needs.release.result == 'failure' || needs.release.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    # An automatic freeze happens at the END of a confirmed recovery, so this job is the only
+    # one that writes `policy.toml` and dispatches the single retry. Narrow, and only here.
+    permissions:
+      contents: write           # the one-line freeze in policy.toml
+      issues: write             # the attempt record and the incident
+      actions: write            # the ONE retry dispatch
+    # Settling the writers and then waiting for the rollback are two bounded waits of their own.
+    timeout-minutes: 150
+    env:
+      ATTEMPT_RUN_ID: ${{ inputs.attempt }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli recover --attempt "${ATTEMPT_RUN_ID}"
+
+  finish-integrate:
+    # An attempt can owe INTEGRATION as well as its image — a PR call that failed, or a
+    # cancellation after `release` succeeded. Nothing used to re-run this stage, so such an
+    # attempt could never be closed and blocked every later release until somebody edited its
+    # record by hand. It is idempotent: an attempt that already integrated returns at once.
+    # Serial with the image below, so the two cannot clobber each other's write to the record.
+    if: ${{ inputs.mode == 'finish' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ATTEMPT_RUN_ID: ${{ inputs.attempt }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli integrate
+
+  finish-image:
+    # `finish`: the controller release stands and its image is owed. It never makes a new
+    # release, and it reuses the attempt's own tag.
+    needs: finish-integrate
+    if: ${{ always() && inputs.mode == 'finish' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      ATTEMPT_RUN_ID: ${{ inputs.attempt }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli image
+
+  finish-close:
+    # Closing an attempt an `finish` repair completed — same finalizer, same rule: only when
+    # nothing is owed.
+    needs: [finish-integrate, finish-image]
+    if: ${{ always() && inputs.mode == 'finish' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ATTEMPT_RUN_ID: ${{ inputs.attempt }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: python -m bot.cli finalize
