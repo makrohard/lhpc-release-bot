@@ -104,6 +104,17 @@ the channel's typed message and offered the source build. Installed boxes are un
   release, older patch images of the current minor line pruned to the newest three, and either a
   fast-forwarded `dev` or a pull request against it. The attempt issue closes itself only once
   both the integration and the image are done.
+
+  **When it opens that pull request, MERGE it — do not squash it.** The PR exists because `dev`
+  diverged, and its whole job is to put the release commit back into `dev`'s ancestry. A squash
+  copies the content and not the commit, so the release commit never becomes an ancestor, `dev`
+  can no longer fast-forward into `main`, and the next release opens the same PR again. It is not
+  a style preference: it is the difference between the PR doing its job and only appearing to.
+  **This needs `allow_merge_commit` enabled on `loraham-pi-control`** — with merge commits off,
+  squash is the only method GitHub offers and the gap cannot be closed at all (rebase-merge does
+  not help either: it replays with new SHAs). Measured on 2026-09-10: PR #4 was squash-merged
+  because it was the only option, `main` stopped being an ancestor of `dev`, and it took a manual
+  rebase of `dev` to repair.
 - **Something failed:** one issue **in this repository**, labelled `auto-release`, naming the
   stage, the run, the observed state, the next action, the pin table with compare links, and
   whatever diagnostics could be fetched. It lives here rather than in the controller so that a
