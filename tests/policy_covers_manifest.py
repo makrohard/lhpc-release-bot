@@ -5,7 +5,12 @@ source upstream would be found only on the next release attempt. This says so on
 here instead. It is the one check that reaches the network, so it lives outside the offline
 suite and is run explicitly.
 
-    python -m tests.policy_covers_manifest
+    python -m tests.policy_covers_manifest                      # the manifest on controller main
+    python -m tests.policy_covers_manifest --manifest PATH      # a checked-out manifest
+
+The second form is what the controller's own CI runs on every push, against its checked-out
+manifest and this repository's `policy.toml` at main: a new pinned source cannot merge there
+without its rule here.
 """
 from __future__ import annotations
 
@@ -21,8 +26,15 @@ MANIFEST = ("https://raw.githubusercontent.com/makrohard/loraham-pi-control/main
 
 
 def main() -> int:
-    with urllib.request.urlopen(MANIFEST, timeout=60) as r:
-        text = r.read().decode()
+    args = sys.argv[1:]
+    if args[:1] == ["--manifest"] and len(args) == 2:
+        text = Path(args[1]).read_text()
+    elif args:
+        print(f"usage: python -m tests.policy_covers_manifest [--manifest PATH]", file=sys.stderr)
+        return 2
+    else:
+        with urllib.request.urlopen(MANIFEST, timeout=60) as r:
+            text = r.read().decode()
     policy = load_policy(Path(__file__).resolve().parents[1] / "policy.toml")
     sources = pinned_sources(text)
     gaps = policy_gaps(policy, [s.path for s in sources])

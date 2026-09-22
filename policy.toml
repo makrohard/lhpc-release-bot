@@ -77,6 +77,10 @@ track = "tag"
 [source."src/sideband"]
 track = "tag"
 
+[source."src/meshchat"]
+track = "release"
+why = "the manifest pins a release version (v2.4.0 = the newest GitHub release, not the branch tip): upstream tags every release and master carries unreleased fixes in between, so the pin follows releases, as meshtastic-firmware does"
+
 # Pinned inputs that are not git sources. Each one is named here so a summary can state its
 # status instead of implying the git list is the whole inventory.
 # Any automatically tracked entry above or below may carry one more key:
