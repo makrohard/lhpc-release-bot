@@ -30,7 +30,7 @@ def main() -> int:
     if args[:1] == ["--manifest"] and len(args) == 2:
         text = Path(args[1]).read_text()
     elif args:
-        print(f"usage: python -m tests.policy_covers_manifest [--manifest PATH]", file=sys.stderr)
+        print("usage: python -m tests.policy_covers_manifest [--manifest PATH]", file=sys.stderr)
         return 2
     else:
         with urllib.request.urlopen(MANIFEST, timeout=60) as r:
