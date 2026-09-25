@@ -65,14 +65,16 @@ track = "release"
 why = "v2.8.x are prereleases; the known-working line follows the newest STABLE release"
 
 [source."src/reticulum"]
-track = "tag"
+track = "tip"
+why = "upstream's git tags lag its releases (2026-09-25: newest tag 1.5.2, PyPI and master's _version.py 1.5.4, master 72 commits past the tag), and the maintainer wants the latest development state; tag tracking would hold the pin at 1.5.2"
 
 [source."src/nomadnet"]
 track = "tip"
 why = "the manifest pins it at the branch tip, not at a release: its pin_tag is a describe-style short sha (`ad10301`) where every tag-tracked source carries a version (`1.5.2`, `v1.6.3`, `2.1.0`), and the newest tag 1.2.0 points at an OLDER commit. Tag tracking would move this pin backwards"
 
 [source."src/lxmf"]
-track = "tag"
+track = "tip"
+why = "same upstream practice as src/reticulum: tags lag PyPI (2026-09-25: tag 1.1.0 = master = the current pin, PyPI already 1.1.1), and the maintainer wants the latest development state; the pin_tag is already describe-style, like nomadnet's"
 
 [source."src/sideband"]
 track = "tag"
