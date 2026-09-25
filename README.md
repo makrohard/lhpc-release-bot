@@ -105,16 +105,13 @@ the channel's typed message and offered the source build. Installed boxes are un
   fast-forwarded `dev` or a pull request against it. The attempt issue closes itself only once
   both the integration and the image are done.
 
-  **When it opens that pull request, MERGE it — do not squash it.** The PR exists because `dev`
-  diverged, and its whole job is to put the release commit back into `dev`'s ancestry. A squash
-  copies the content and not the commit, so the release commit never becomes an ancestor, `dev`
-  can no longer fast-forward into `main`, and the next release opens the same PR again. It is not
-  a style preference: it is the difference between the PR doing its job and only appearing to.
-  **This needs `allow_merge_commit` enabled on `loraham-pi-control`** — with merge commits off,
-  squash is the only method GitHub offers and the gap cannot be closed at all (rebase-merge does
-  not help either: it replays with new SHAs). Measured on 2026-09-10: PR #4 was squash-merged
-  because it was the only option, `main` stopped being an ancestor of `dev`, and it took a manual
-  rebase of `dev` to repair.
+  **When it opens that pull request, SQUASH-merge it.** `loraham-pi-control`'s `dev` ruleset
+  requires linear history, so a merge commit cannot land. The PR brings the release's content to
+  `dev`, not the release commit: afterwards `main` is no longer an ancestor of `dev`, so the
+  maintainer's next patch is cut as a release commit on top of `main`, not as a fast-forward of
+  `main` to `dev`. The next bot release opens its pull request the same way.
+  Releases are cut from `main` only, and changes on `dev` do not influence a release: `dev`'s
+  state, a merge-back pull request that is still open included, never gates, delays or shapes one.
 - **Something failed:** one issue **in this repository**, labelled `auto-release`, naming the
   stage, the run, the observed state, the next action, the pin table with compare links, and
   whatever diagnostics could be fetched. It lives here rather than in the controller so that a

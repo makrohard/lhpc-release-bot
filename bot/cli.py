@@ -1314,7 +1314,7 @@ def stage_integrate(ctx: Ctx) -> int:
         LHPC, branch, "dev", f"Bring {att.version} back to dev",
         f"`{att.version}` was released from `main`. Version scalars and changelog placement "
         f"were resolved automatically ({', '.join(resolved) or 'nothing to resolve'}); "
-        f"everything else is the release commit unchanged. Merge when the checks are green.")
+        f"everything else is the release commit unchanged. Squash-merge when the checks are green.")
     att.state = "integrated" if att.state == "released" else att.state
     att.integration = f"pr:{pr['number']}"
     att.notes.append(f"dev diverged; PR #{pr['number']} opened")
