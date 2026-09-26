@@ -18,7 +18,6 @@
 track = "manual"
 why = "the real daemon needs a radio to start; the test lab cannot prove it, so it moves by hand with the box test matrix"
 
-# READINESS REHEARSAL 2026-09-10 — restore to `track = "manual"` when it ends.
 [source."src/LoRaHAM_Daemon"]
 track = "manual"
 why = "the same upstream repository as src/loraham-daemon (chat builds from it); moving one without the other would put two commits of one repo in the manifest"
@@ -41,7 +40,7 @@ track = "tip"
 
 [source."src/MeshCom-Firmware"]
 track = "tip"
-why = "TEMPORARY CARRY: the manifest points at makrohard/MeshCom-Firmware branch `lhpc-speed` (upstream icssw-org `dev` plus our two speed PRs), which the fork's weekly carry workflow refreshes. Tip tracking needs that branch to only move FORWARD (merge upstream `dev` into it, never rebase or force-push): a rewritten branch leaves the pin off its line and faults the whole run. Retire with R18 and makrohard/MeshCom-Firmware#1 once icssw-org `dev` contains both PRs: repin upstream and restore the upstream `dev` rule"
+why = "TEMPORARY CARRY: the manifest points at makrohard/MeshCom-Firmware branch `lhpc-speed`, which carries two speed fixes offered upstream; the fork's weekly carry workflow merges icssw-org `dev` in when the build stays green. Tip tracking needs that branch to only move FORWARD (upstream `dev` merged in, never rebased or force-pushed): a rewritten branch leaves the pin off its line and faults the whole run. Retire with makrohard/MeshCom-Firmware#1 once icssw-org `dev` contains both fixes: repin upstream and restore the upstream `dev` rule"
 
 [source."src/openhop-core"]
 track = "tip"

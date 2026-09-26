@@ -160,19 +160,14 @@ overwriting somebody's edit.
 **The regression has to be confined to the release lane.** Any required job other than the lane
 going red is treated as a different problem and suppresses the hold — deliberately, because a
 lane that blames one stack while something else is also broken is not evidence about that stack.
-The practical consequence is worth knowing before you rely on this, stated as what was actually
-tested rather than as a general promise. **A failure that also turns the ordinary `testlab` job
-red cannot produce a lane attribution.** That was measured on 2026-09-10: a kiss readiness
-regression on `main` made the lane emit `STACK-REGRESSION stack=kiss phase=start`, which the
-attribution rule read correctly, while six tests in the ordinary job errored at setup with
-`Run FAILED for 'kiss'` — so the bot reported an ordinary failure and held nothing.
+**A failure that also turns the ordinary `testlab` job red cannot produce a lane attribution.** A
+kiss readiness regression, for example, made the lane emit `STACK-REGRESSION stack=kiss
+phase=start` while six ordinary tests errored at setup with `Run FAILED for 'kiss'`, so the bot
+reported an ordinary failure and held nothing.
 
-What that does **not** say is that a stack appearing in the ordinary suite can never be held. It
-depends on the failure, not on the stack: a different fault in the same stack need not touch the
-ordinary cases at all, and owned binary-build attribution runs earlier and is unaffected by this
-rule entirely. For orientation, the same day's count of ordinary-suite files naming each stack was
-voice and chat none, kiss and graywolf two each, meshcore and meshcom three — a guide to which
-regressions are likely to spill, not a list of what may ever be frozen.
+That does **not** mean a stack in the ordinary suite can never be held. It depends on the failure,
+not on the stack: a different fault in the same stack need not touch the ordinary cases at all,
+and owned binary-build attribution runs earlier and is unaffected by this rule.
 
 That is the intended trade, not an oversight: the alternative is a rule that can freeze an
 upstream pin while the real cause is somewhere else entirely. For a widely-depended-on stack the
@@ -199,8 +194,7 @@ freeze rather than on the edit that caused it: an automatic freeze updates the o
 incident instead of opening a fresh one, and that issue still carries the claim comment from the
 retry the previous hold already spent. The new retry then reads a claim that is not its own and
 stands down — *"run … already claimed this retry"* — dying at `plan` for a reason that has nothing
-to do with the stack it was sent to prove. Observed on 2026-09-10, and caught only because the
-stale incident was noticed minutes before the next hold was written.
+to do with the stack it was sent to prove.
 
 ## Running it, pausing it, retrying it
 
@@ -296,11 +290,10 @@ trustworthy run that actually measured a failure is **failed**. A missing artifa
 infrastructure fault, and it must never be reported as a broken upstream.
 
 **An attempt that wrote a hold stays open until its retry is SETTLED** — not until it is claimed.
-Recovery used to close every attempt it settled, which put the obligation out of reach: `attempt`
-issues are looked up by OPEN state, so a closed one answers "no attempt to recover" while the
-policy still carries the hold. Now the index is restored and the branch deleted as before, but the
-issue stays open, the summary says so, and it keeps blocking unrelated releases — except the one
-retry it is owed, which is allowed past its own parent and nothing else's.
+Recovery restores the index and deletes the branch, but keeps the issue open: `attempt` issues are
+looked up by OPEN state, so a closed one would answer "no attempt to recover" while the policy
+still carries the hold. The summary says so, and the issue keeps blocking unrelated releases —
+except the one retry it is owed, which is allowed past its own parent and nothing else's.
 
 **A claim is not a settlement.** The claim only records that a child took the work; the parent is
 settled when that child's own outcome is KNOWN — it released with the hold in place, or it proved
@@ -311,7 +304,7 @@ such a case ends with a person closing the parent, which is the right party to d
 retry ever runs, close it by hand once you have decided what to do with the hold (the incident
 names the `freeze` lines to delete).
 
-Two ways that obligation ends other than a green retry, both observed:
+Two ways that obligation ends other than a green retry:
 
 - **the retry crashes.** One hold gets one retry, and a crashed child has spent it: no other run
   may claim that incident. `recover` on the PARENT is the way out — it reconciles the child that
