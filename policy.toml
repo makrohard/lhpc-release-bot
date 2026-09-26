@@ -41,7 +41,7 @@ track = "tip"
 
 [source."src/MeshCom-Firmware"]
 track = "tip"
-why = "upstream develops on `dev`; its tags lag the branch by design"
+why = "TEMPORARY CARRY: the manifest points at makrohard/MeshCom-Firmware branch `lhpc-speed` (upstream icssw-org `dev` plus our two speed PRs), which the fork's weekly carry workflow refreshes. Tip tracking needs that branch to only move FORWARD (merge upstream `dev` into it, never rebase or force-push): a rewritten branch leaves the pin off its line and faults the whole run. Retire with R18 and makrohard/MeshCom-Firmware#1 once icssw-org `dev` contains both PRs: repin upstream and restore the upstream `dev` rule"
 
 [source."src/openhop-core"]
 track = "tip"

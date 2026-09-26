@@ -181,3 +181,53 @@ def test_an_input_owned_by_another_pin_is_never_moved_on_its_own():
 @pytest.mark.parametrize("status", ["at-pin", "manual", "fault"])
 def test_only_a_move_is_a_move(status):
     assert not Finding(key="k", track="tip", status=status).moves
+
+
+def test_a_fork_carry_branch_is_tracked_at_its_tip_until_it_is_rebased(tmp_path):
+    """The temporary MeshCom carry: the manifest points at a FORK and a NON-default branch
+    (`lhpc-speed` = upstream `dev` + our patches). Real git, because the behaviour is git's: the
+    real Remote must fetch that branch from that remote, a refresh that MERGES upstream is an
+    ordinary forward move, and a refresh that REBASES leaves the pin off the branch — a fault,
+    which stops the run. policy.toml's why for src/MeshCom-Firmware depends on exactly this."""
+    import subprocess
+
+    from bot.upstream import Remote
+
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def git(repo, *args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                              text=True, env=env).stdout.strip()
+
+    def commit(repo, name):
+        (repo / name).write_text(name)
+        git(repo, "add", name)
+        git(repo, "commit", "-q", "-m", name)
+        return git(repo, "rev-parse", "HEAD")
+
+    up, fork = tmp_path / "up", tmp_path / "fork"
+    up.mkdir()
+    git(up, "init", "-q", "-b", "dev")
+    commit(up, "u1")
+    subprocess.run(["git", "clone", "-q", str(up), str(fork)], check=True, env=env)
+    git(fork, "checkout", "-q", "-b", "lhpc-speed")
+    pin = commit(fork, "speed-patch")               # the carried patch, pinned by the manifest
+    source = src(pin, remote=f"file://{fork}", branch="lhpc-speed", path="src/MeshCom-Firmware")
+
+    def judge(label):
+        return examine(source, {"track": "tip"}, Remote(tmp_path / f"work-{label}"))
+
+    commit(up, "u2")                                # upstream moves on
+
+    git(fork, "fetch", "-q", "origin", "dev")      # forward refresh: MERGE upstream dev
+    git(fork, "merge", "-q", "--no-edit", "origin/dev")
+    merged = git(fork, "rev-parse", "HEAD")
+    f = judge("merge")
+    assert (f.status, f.candidate) == ("move", merged)
+
+    git(fork, "reset", "-q", "--hard", pin)        # the same refresh done as a REBASE
+    git(fork, "rebase", "-q", "origin/dev")
+    assert git(fork, "rev-parse", "HEAD") != pin
+    f = judge("rebase")
+    assert f.status == "fault" and not f.moves
