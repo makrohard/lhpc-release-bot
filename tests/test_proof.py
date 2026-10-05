@@ -344,7 +344,7 @@ class _ProveCtx:
     def jobs(self, repo, run_id, attempt=1):
         return list(self._jobs_by_run[int(run_id)])
 
-    def artifact_member(self, repo, run_id, name, member):
+    def artifact_member(self, repo, run_id, name, member, attempt=1):
         cases = "".join(
             f'<testcase name="{c}">'
             + ('<failure>STACK-REGRESSION stack=kiss phase=start</failure>'
@@ -491,11 +491,17 @@ def test_the_artifact_download_never_replays_the_credential_at_the_storage_host(
             return False
 
     def fake_urlopen(req, timeout=None):
-        """The plain opener: the artifacts listing, and the signed download."""
+        """The plain opener: the run, the artifacts listing, and the signed download."""
+        if req.full_url.endswith("/actions/runs/1/attempts/1"):
+            return _Resp(_json.dumps({"id": 1, "run_attempt": 1,
+                                      "run_started_at": "2026-01-01T00:00:00Z"}).encode())
+        if req.full_url.endswith("/actions/runs/1/attempts/2"):
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
         if req.full_url.endswith("/artifacts?per_page=100"):
             api_headers.append({k.lower(): v for k, v in req.headers.items()})
             return _Resp(_json.dumps({"artifacts": [
-                {"name": "out", "archive_download_url": "https://api.example/dl"}]}).encode())
+                {"name": "out", "archive_download_url": "https://api.example/dl",
+                 "created_at": "2026-01-01T00:05:00Z"}]}).encode())
         signed_headers.append({k.lower(): v for k, v in req.headers.items()})
         return _Resp(b"PK\x03\x04zipbytes")
 
@@ -509,7 +515,7 @@ def test_the_artifact_download_never_replays_the_credential_at_the_storage_host(
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _Opener())
 
-    blob = GitHub("t" * 20).artifact("o/r", 1, "out")
+    blob = GitHub("t" * 20).artifact("o/r", 1, "out", 1)
 
     assert blob == b"PK\x03\x04zipbytes", "the zip must come back as bytes, not parsed"
     assert all(h.get("accept") != "application/zip" for h in api_headers), \

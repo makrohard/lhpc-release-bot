@@ -196,6 +196,30 @@ class Ctx:
 # ---------------------------------------------------------------------------- stage: plan
 
 
+def _wait(ctx, rec: dict, bound: float, att: Attempt | None = None, number: int = 0) -> dict:
+    """The one wait for a run this bot judges. When GitHub re-ran a first attempt that lost its
+    runner (`GitHub.wait`), the record moves to the new attempt — every judge compares the run
+    against the attempt recorded — and the re-run is written down where a maintainer reads."""
+    run = ctx.gh.wait(rec["repo"], int(rec["id"]), bound)
+    if run.get("rerun"):
+        # The attempt THIS bot asked for, not whatever GitHub reports now: a third attempt
+        # somebody else started is not the one judged, and the identity check must say so.
+        rec["attempt"] = run["rerun"]["attempt"] + 1
+        note = (f"{rec['repo']} run {rec['id']}: attempt {run['rerun']['attempt']} lost its "
+                f"runner ({', '.join(run['rerun']['jobs'])}); the failed jobs were re-run once "
+                f"and attempt {rec['attempt']} is the one judged")
+    elif run.get("rerun_error"):
+        note = (f"{rec['repo']} run {rec['id']} lost its runner, but the re-run was refused: "
+                f"{run['rerun_error']}")
+    else:
+        return run
+    ctx.summary(f"\n{note}")
+    if att is not None:
+        att.notes.append(note)
+        ctx.save_attempt(number, att)
+    return run
+
+
 def _findings(ctx: Ctx, manifest_text: str, policy: dict) -> tuple:
     sources = mf.pinned_sources(manifest_text)
     gaps = up.policy_gaps(policy, [s.path for s in sources])
@@ -520,11 +544,11 @@ def _verify_baseline(ctx: Ctx, frozen, ref: str) -> tuple:
     # above, and the check below refuses a ref that moved while the proof was in flight.
     run_id = ctx.gh.dispatch(LHPC, TESTLAB_WORKFLOW, ref, {"release_verify": "true"})
     rec = ctx.record_run(LHPC, run_id)
-    run = ctx.gh.wait(LHPC, run_id, BOUNDS["testlab"])
+    run = _wait(ctx, rec, BOUNDS["testlab"])
     at = Attempt(run_id=ctx.run_id, candidate_sha=baseline)   # identity is asked of the commit
     identity, offlane, outcome = _run_problems(ctx, at, "testlab", rec, run, REQUIRED_TESTLAB)
     junit = ctx.gh.artifact_member(LHPC, run_id, "testlab-logs-release-verify",
-                                   "junit-release.xml")
+                                   "junit-release.xml", rec.get("attempt", 1))
     unreadable, red = _release_case_problems(
         junit, required_release_cases(ctx.gh.file_at(LHPC, RELEASE_CASES_PATH, baseline)))
     moved = []
@@ -748,9 +772,9 @@ def stage_build(ctx: Ctx) -> int:
                               "lhpc_ref": att.candidate_sha, "smoke_test": "true"})
     att.runs[f"binary:{stack}"] = ctx.record_run(BIN, run_id)
     ctx.save_attempt(number, att)
-    run = ctx.gh.wait(BIN, run_id, BOUNDS["binary"])
+    run = _wait(ctx, att.runs[f"binary:{stack}"], BOUNDS["binary"], att, number)
 
-    entry = _candidate_entry(ctx, run_id, stack, att.candidate_sha)
+    entry = _candidate_entry(ctx, att.runs[f"binary:{stack}"], stack, att.candidate_sha)
     if entry:
         att.published[stack] = entry
         ctx.save_attempt(number, att)
@@ -907,13 +931,14 @@ def _builder_regression(ctx: Ctx, stack: str, run_id: int, run: dict, att: Attem
     """
     if run.get("conclusion") != "failure":
         return []
-    raw = ctx.gh.artifact_member(BIN, run_id, f"out-{stack}-{run_id}", f"{stack}.regression")
+    rec = att.runs.get(f"binary:{stack}") or {}
+    raw = ctx.gh.artifact_member(BIN, run_id, f"out-{stack}-{run_id}", f"{stack}.regression",
+                                 rec.get("attempt", 1))
     text = raw.decode("utf-8", "replace") if raw else ""
     if af.attributed_stacks(text) != [stack]:
         # It may only blame the stack it was dispatched for; anything else is a builder that has
         # lost track of what it was building.
         return []
-    rec = att.runs.get(f"binary:{stack}") or {}
     # The run GitHub returned must be the execution this attempt started. A re-run keeps the run
     # id while the attempt number changes, so evidence written by an earlier execution would
     # otherwise be read as what a later red one proved. The builder SHA is compared against the
@@ -952,10 +977,13 @@ def _evidence_field(text: str, field: str) -> str:
     return ""
 
 
-def _candidate_entry(ctx: Ctx, run_id: int, stack: str, candidate_sha: str):
-    """`entry_from_fragment` on the build job's own artifact — the fetch, nothing more."""
+def _candidate_entry(ctx: Ctx, rec: dict, stack: str, candidate_sha: str):
+    """`entry_from_fragment` on the build job's own artifact, from the recorded attempt — the
+    fetch, nothing more."""
+    run_id = int(rec["id"])
     return entry_from_fragment(
-        ctx.gh.artifact_member(BIN, run_id, f"out-{stack}-{run_id}", ".frag.json"),
+        ctx.gh.artifact_member(BIN, run_id, f"out-{stack}-{run_id}", ".frag.json",
+                               rec.get("attempt", 1)),
         stack, candidate_sha)
 
 
@@ -995,7 +1023,7 @@ def stage_prove(ctx: Ctx) -> int:
         if not rec:
             identity.append(f"{name}: this attempt never recorded a run")
             continue
-        run = ctx.gh.wait(LHPC, int(rec["id"]), bound)
+        run = _wait(ctx, rec, bound, att, number)
         got_identity, got_offlane, got_outcome = _run_problems(ctx, att, name, rec, run,
                                                                 required)
         # A measured red OUTSIDE the release lane disqualifies an attribution exactly as a broken
@@ -1008,7 +1036,8 @@ def stage_prove(ctx: Ctx) -> int:
     problems = identity + outcome
 
     junit = ctx.gh.artifact_member(LHPC, int(att.runs["testlab"]["id"]),
-                                   "testlab-logs-release-verify", "junit-release.xml")
+                                   "testlab-logs-release-verify", "junit-release.xml",
+                                   att.runs["testlab"].get("attempt", 1))
     unreadable, red = _release_case_problems(
         junit, required_release_cases(
             ctx.gh.file_at(LHPC, RELEASE_CASES_PATH, att.candidate_sha)))
@@ -1497,7 +1526,7 @@ def stage_image(ctx: Ctx) -> int:
     att.runs["image"] = ctx.record_run(IMG, run_id)
     ctx.save_attempt(number, att)
 
-    run = ctx.gh.wait(IMG, run_id, BOUNDS["image"])
+    run = _wait(ctx, att.runs["image"], BOUNDS["image"], att, number)
     reasons = image_problems(tag, att.candidate_sha, run,
                              ctx.gh.release_by_tag(IMG, tag), ctx.gh.tag_message(IMG, tag))
     if reasons:
@@ -1698,7 +1727,7 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
         if not (name.startswith("binary:") or name == "rollback"):
             continue
         rid = int(rec["id"]) if isinstance(rec, dict) else int(rec)
-        run = ctx.gh.wait(BIN, rid, BOUNDS["settle"], poll_s=15)
+        run = ctx.gh.wait(BIN, rid, BOUNDS["settle"], poll_s=15, rerun=False)
         if run.get("timed_out") or run.get("status") != "completed":
             unsettled.append(f"{name} (run {rid}) is still running")
     if unsettled:
@@ -1720,7 +1749,7 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
             # judged against `published`, so an entry known only to this loop would reach the
             # child as no expectation at all, and the child would overwrite whatever it found.
             rec = att.runs.get(f"binary:{stack}")
-            entry = (_candidate_entry(ctx, int(rec["id"]), stack, att.candidate_sha)
+            entry = (_candidate_entry(ctx, rec, stack, att.candidate_sha)
                      if rec else None)
             if entry:
                 att.published[stack] = entry
@@ -1751,7 +1780,7 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
         # `recover` would start a second rollback on top of it.
         att.runs["rollback"] = ctx.record_run(BIN, rb)
         ctx.save_attempt(number, att)
-        run = ctx.gh.wait(BIN, rb, BOUNDS["settle"], poll_s=15)
+        run = ctx.gh.wait(BIN, rb, BOUNDS["settle"], poll_s=15, rerun=False)
         if run.get("conclusion") != "success":
             att.notes.append(f"ROLLBACK NOT CONFIRMED: {run.get('html_url')}")
             ctx.save_attempt(number, att)

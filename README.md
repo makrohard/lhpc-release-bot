@@ -90,6 +90,8 @@ proved.
 | image | tags `loraham-images`, waits for both variants | a red build, a draft release, missing evidence, or a tag that no longer names this release's controller |
 | finalize | closes the attempt | anything still owed: it stays open instead |
 
+A run the bot waits on (controller CI, test lab, binary build, image build) whose first attempt is red only because a job lost its runner has its failed jobs re-run once, within the same time bound, and the second attempt is the one judged. Runner loss is what GitHub itself annotates on the job — "The runner has received a shutdown signal", "lost communication with the server" or "was not acquired by Runner" — and every other failed job must `needs` a lost one, directly or through other jobs (read from the run's own workflow file at its commit), and have started after it ended. The attempt issue notes the re-run. Any other red, a workflow file that cannot be read, too little time left, and any second attempt are judged as they are. Evidence read from the re-run's artifacts is the second attempt's own upload, or one from a carried-over job that finished before any failed job started; anything else reads as absent.
+
 When a stage before the commit point fails, recovery restores the index and deletes the candidate branch. If the failure named the stack that broke, it also holds that stack and retries once — see [Freeze a pin](#freeze-a-pin).
 
 The order is forced by the proof: the aarch64 test lab installs MeshCom and Meshtastic from the

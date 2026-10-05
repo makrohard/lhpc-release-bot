@@ -493,7 +493,7 @@ class _BuildGh:
         self.member = member
         self.asked = []
 
-    def artifact_member(self, repo, run_id, name, suffix):
+    def artifact_member(self, repo, run_id, name, suffix, attempt=1):
         self.asked.append((name, suffix))
         return self.member
 
@@ -637,7 +637,7 @@ class _RedBuilderGh(FakeGh):
         return {"conclusion": "failure", "workflow_id": 9, "run_attempt": 1,
                 "head_sha": "c" * 40, "html_url": "https://example.invalid/build/777"}
 
-    def artifact_member(self, repo, run_id, name, suffix):
+    def artifact_member(self, repo, run_id, name, suffix, attempt=1):
         # The VISIBLE name the builder writes; a dotfile would never have survived the upload.
         return self.marker if suffix.endswith(".regression") else b""
 
@@ -1246,7 +1246,7 @@ def test_the_frozen_only_branch_is_actually_driven(tmp_path, monkeypatch):
         def jobs(self, repo, run_id, attempt):
             return [{"name": n, "conclusion": "success"} for n in cli.REQUIRED_TESTLAB]
 
-        def artifact_member(self, repo, run_id, name, suffix):
+        def artifact_member(self, repo, run_id, name, suffix, attempt=1):
             cases = "".join(f'<testcase name="{c}"/>' for c in
                             json.loads(CASE_JSON)["required_cases"])
             return f"<testsuite>{cases}</testsuite>".encode()
@@ -1321,7 +1321,7 @@ def _baseline_gh(*, junit=None, cases=CASE_JSON, refs=("b" * 40,), red=()):
         def jobs(self, repo, run_id, attempt):
             return [{"name": n, "conclusion": "success"} for n in cli.REQUIRED_TESTLAB]
 
-        def artifact_member(self, repo, run_id, name, suffix):
+        def artifact_member(self, repo, run_id, name, suffix, attempt=1):
             if junit is not None:
                 return junit
             body = "".join(
@@ -1525,7 +1525,7 @@ def _baseline_gh_invalid(*, head_sha=None, conclusion="failure", junit=None, ref
                      "failure" if n in also_red else "success"}
                     for n in cli.REQUIRED_TESTLAB]
 
-        def artifact_member(self, repo, run_id, name, suffix):
+        def artifact_member(self, repo, run_id, name, suffix, attempt=1):
             if junit is not None:
                 return junit
             body = "".join(
