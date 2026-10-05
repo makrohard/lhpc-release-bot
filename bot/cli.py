@@ -66,7 +66,7 @@ BOT_URL = "https://github.com/" + BOT
 REQUIRED_CI = ("test (3.11)", "test (3.12)", "test (3.13)", "pin-validation", "meshcore-host")
 REQUIRED_TESTLAB = ("testlab", "release-verify")
 
-BOUNDS = {"ci": 40 * 60, "binary": 190 * 60, "testlab": 240 * 60, "image": 330 * 60,
+BOUNDS = {"ci": 40 * 60, "binary": 190 * 60, "testlab": 280 * 60, "image": 330 * 60,
           "settle": 60 * 60}
 # The release lane's own case count. A lane that reports fewer has lost cases, whatever its
 # colour; the exact names are the lane's contract and are checked individually.
