@@ -231,3 +231,33 @@ def test_a_fork_carry_branch_is_tracked_at_its_tip_until_it_is_rebased(tmp_path)
     assert git(fork, "rev-parse", "HEAD") != pin
     f = judge("rebase")
     assert f.status == "fault" and not f.moves
+
+
+class _Unreadable(FakeRemote):
+    def __init__(self, said):
+        super().__init__([A])
+        self.said = said
+
+    def branch_tip(self, remote, branch):
+        raise RuntimeError(self.said)
+
+    def latest_pypi(self, package):
+        raise RuntimeError(self.said)
+
+
+@pytest.mark.parametrize("said, status", [
+    ("git -C x fetch -q --tags origin main: fatal: unable to access 'https://h/': "
+     "Could not resolve host: h", "skipped"),
+    ("cannot read PyPI p: <urlopen error [Errno -3] Temporary failure in name resolution>",
+     "skipped"),
+    ("git -C x fetch -q --tags origin main: fatal: couldn't find remote ref main", "fault"),
+    ("cannot read releases of o/r: HTTP Error 404: Not Found", "fault"),
+])
+def test_an_unreachable_upstream_is_skipped_and_any_other_read_failure_is_a_fault(said, status):
+    # A remote nobody could reach keeps its pin for this run; a remote that ANSWERED with
+    # something wrong (no such branch, no such repository) still stops the release.
+    git_source = examine(src(A), {"track": "tip"}, _Unreadable(said))
+    pypi_extra = examine_extra("cli", {"kind": "pypi", "package": "p", "track": "release"},
+                               "1.0.0", _Unreadable(said))
+    assert (git_source.status, pypi_extra.status) == (status, status)
+    assert not git_source.moves and not pypi_extra.moves

@@ -18,7 +18,7 @@ def _repo_of(remote: str) -> str:
 
 def findings_table(findings) -> str:
     """Every tracked input with its status — moved, at the pin, reported only, or faulty."""
-    icon = {"move": "→", "at-pin": "=", "manual": "·", "fault": "!", "frozen": "❄"}
+    icon = {"move": "→", "at-pin": "=", "manual": "·", "fault": "!", "frozen": "❄", "skipped": "~"}
     rows = ["| | input | tracks | now | upstream | note |", "|---|---|---|---|---|---|"]
     for f in findings:
         repo = _repo_of(f.remote)
@@ -50,13 +50,18 @@ def summary(findings, decision: str, extra: str = "") -> str:
     # Frozen inputs are counted apart from the movable ones and stay in the tracked total: a
     # deliberate hold must be visible every week without being mistaken for something to do.
     frozen = [f for f in findings if f.status == "frozen"]
+    skipped = [f for f in findings if f.status == "skipped"]
     head = [f"## {decision}", "", scope_note(), "",
             f"**{len(moved)} input(s) to move**, {len(faults)} fault(s), "
             + (f"{len(frozen)} frozen, " if frozen else "")
+            + (f"{len(skipped)} skipped, " if skipped else "")
             + f"{len(findings)} tracked in total.", ""]
     if frozen:
         head += ["Held on purpose, and not moved by this run:", ""]
         head += [f"- `{f.key}` — {f.detail or 'held'}" for f in frozen] + [""]
+    if skipped:
+        head += ["Not reachable this run; the pin stays and the next run looks again:", ""]
+        head += [f"- `{f.key}` — {f.detail}" for f in skipped] + [""]
     if extra:
         head += [extra, ""]
     return "\n".join(head) + findings_table(findings) + "\n"

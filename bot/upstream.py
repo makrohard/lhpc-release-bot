@@ -37,7 +37,7 @@ class Finding:
     which is exactly the thing a release must not imply."""
     key: str                       # source path, or extra.<name>
     track: str
-    status: str                    # "at-pin" | "move" | "manual" | "fault"
+    status: str                    # "at-pin" | "move" | "manual" | "frozen" | "skipped" | "fault"
     current: str = ""
     candidate: str = ""
     tag: str = ""
@@ -262,7 +262,24 @@ def examine(source, rule: dict, remote: Remote) -> Finding:
         described = tag or remote.describe(source.remote, source.branch, candidate)
         return Finding(status="move", candidate=candidate, tag=described, **base)
     except RuntimeError as exc:
-        return Finding(status="fault", detail=str(exc), **base)
+        return _unreadable(exc, base)
+
+
+# Words of a transfer that did not happen — the remote, DNS or the network, never the content.
+# Anything else a git or HTTP read says (a missing ref, a rewritten branch, a 404) stays a fault.
+UNREACHABLE = re.compile(
+    r"Could not resolve host|Temporary failure in name resolution|Name or service not known|"
+    r"Failed to connect|Connection (timed out|refused|reset)|timed out|"
+    r"The requested URL returned error: 5\d\d|HTTP Error 5\d\d|rate limit|"
+    r"RPC failed|early EOF", re.IGNORECASE)
+
+
+def _unreadable(exc: Exception, base: dict) -> Finding:
+    """An upstream that could not be REACHED is skipped for this run, not a stop: the pin stays
+    where it is and next week's run looks again. Every other read failure is a fault."""
+    if UNREACHABLE.search(str(exc)):
+        return Finding(status="skipped", detail=f"not reachable this run, pin kept ({exc})", **base)
+    return Finding(status="fault", detail=str(exc), **base)
 
 
 def _repo_of(remote_url: str) -> str:
@@ -312,7 +329,7 @@ def examine_extra(name: str, rule: dict, current: str, remote: Remote) -> Findin
         if frozen:
             return Finding(status="frozen",
                            detail=f"upstream not readable ({exc}) — held: {frozen}", **base)
-        return Finding(status="fault", detail=str(exc), **base)
+        return _unreadable(exc, base)
 
     if not latest:
         return Finding(status="fault", detail="upstream published nothing readable", **base)
