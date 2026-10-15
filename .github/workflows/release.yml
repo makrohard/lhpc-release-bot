@@ -75,6 +75,10 @@ jobs:
       || inputs.mode == 'dry-run') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+      actions: write            # the ONE automatic `finish` dispatch for an attempt owing it
     outputs:
       proceed: ${{ steps.plan.outputs.proceed }}
       version: ${{ steps.plan.outputs.version }}

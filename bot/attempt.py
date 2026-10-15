@@ -93,6 +93,9 @@ class Attempt:
     # The moved findings as the plan saw them (key, current, candidate, …): the Inputs table of a
     # report written after the plan, when the stage that stops no longer has the findings.
     inputs: list = field(default_factory=list)
+    # The ONE automatic `finish` for a released attempt that owes only integration and the image:
+    # "" none; "dispatching:<run id>" claimed by that run, before sending; else the finish run id.
+    finish_run: str = ""
 
     @property
     def rehearsal(self) -> bool:

@@ -262,7 +262,10 @@ Two ways out, both from the same issue:
 
 - the controller release exists and something after it is missing → `finish`, which re-runs
   the integration and the image in that order and closes the attempt if nothing is left. Both
-  stages are idempotent, so one that already completed is a no-op;
+  stages are idempotent, so one that already completed is a no-op. When EVERY attempt blocking a
+  `full` run owes only these two, that run dispatches `finish` itself, once per attempt (the
+  record keeps `finish_run`), and stops without a release. A claim that recorded no finish run,
+  or a finish run that ended with the attempt still owing, stops the run (`observe`) and names it;
 - nothing was released → `recover`, which cancels the children, WAITS for them to stop, puts the
   binary index back and deletes the candidate branch.
 

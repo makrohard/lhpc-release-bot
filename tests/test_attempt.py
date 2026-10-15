@@ -140,3 +140,110 @@ def test_a_mutated_record_must_say_what_it_dispatched():
         att.validate()
     att.dispatched = ["meshtastic"]
     att.validate()
+
+
+# ---- the automatic `finish` of a released attempt that owes only integration and the image ----
+
+class _PlanCtx:
+    """Only what `stage_plan` reaches for before the blocking check."""
+    token, mode, retry_of, run_id = "t" * 20, "full", "", "5000"
+
+    def __init__(self, att, dispatch_error=None, finish=None):
+        self.att, self.saved, self.sent, self.summaries = att, [], [], []
+        self.gh = self.bot_gh = self
+        self._error, self._finish = dispatch_error, finish or {"status": "in_progress"}
+
+    # Ctx
+    def open_attempts(self):
+        return [(7, self.att)]
+
+    def save_attempt(self, number, att):
+        self.saved.append(att.finish_run)
+        return number
+
+    def summary(self, text):
+        self.summaries.append(text)
+
+    def out(self, **kv):
+        pass
+
+    # GitHub
+    def whoami(self):
+        return {"login": "bot"}
+
+    def token_expiry(self):
+        return ""
+
+    def get(self, path):
+        return {}
+
+    def run(self, repo, run_id):
+        return dict(self._finish, id=run_id)
+
+    def dispatch(self, repo, workflow, ref, inputs=None):
+        self.sent.append(inputs)
+        if self._error:
+            raise self._error
+        return 8123
+
+
+def _owing(**over):
+    base = {"run_id": "4000", "state": "released", "version": "0.12.10", "base_sha": "b" * 40,
+            "candidate_sha": "c" * 40, "branch": "pins/0.12.10-4000", "image_tag": "",
+            "integration": ""}
+    return Attempt(**{**base, **over})
+
+
+def test_an_attempt_owing_only_integration_and_image_is_finished_once():
+    from bot import cli
+    ctx = _PlanCtx(_owing())
+    assert cli.stage_plan(ctx) == 0
+    assert ctx.sent == [{"mode": "finish", "attempt": "4000"}]
+    assert ctx.saved == ["dispatching:5000", "8123"]          # claimed before the send
+    second = _PlanCtx(ctx.att)                                 # the next scheduled run
+    assert cli.stage_plan(second) == 0 and second.sent == []
+
+
+def test_a_claim_without_a_run_id_stops_naming_its_claimant_and_sends_nothing():
+    # A green weekly run beside a claim nobody will ever resolve would hide it for good.
+    from bot import cli
+    ctx = _PlanCtx(_owing(finish_run="dispatching:4999"))
+    with pytest.raises(cli.Stop) as stop:
+        cli.stage_plan(ctx)
+    assert ctx.sent == [] and "4999" in stop.value.observed
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "success", "cancelled"])
+def test_a_finish_run_that_ended_with_the_attempt_still_owing_stops(conclusion):
+    from bot import cli
+    ctx = _PlanCtx(_owing(finish_run="8123"),
+                   finish={"status": "completed", "conclusion": conclusion})
+    with pytest.raises(cli.Stop) as stop:
+        cli.stage_plan(ctx)
+    assert ctx.sent == [] and "8123" in stop.value.observed and conclusion in stop.value.observed
+
+
+def test_a_refused_finish_dispatch_releases_its_claim():
+    from bot import cli
+    from bot.gh import GitHubError
+    ctx = _PlanCtx(_owing(), dispatch_error=GitHubError("POST /repos/o/r/… -> 422: bad input"))
+    with pytest.raises(cli.Stop):
+        cli.stage_plan(ctx)
+    assert ctx.att.finish_run == "" and ctx.saved == ["dispatching:5000", ""]
+
+
+@pytest.mark.parametrize("said", ["POST /repos/o/r/… -> <urlopen error timed out>",
+                                  "POST /repos/o/r/… -> 502: bad gateway"])
+def test_a_finish_dispatch_that_may_have_been_accepted_keeps_its_claim(said):
+    # The request may have started a run whose reply was lost: never send a second one.
+    from bot import cli
+    from bot.gh import GitHubError
+    ctx = _PlanCtx(_owing(), dispatch_error=GitHubError(said))
+    with pytest.raises(cli.Stop):
+        cli.stage_plan(ctx)
+    assert ctx.att.finish_run == "dispatching:5000"
+    later = _PlanCtx(ctx.att)
+    with pytest.raises(cli.Stop):
+        cli.stage_plan(later)
+    assert later.sent == []
+

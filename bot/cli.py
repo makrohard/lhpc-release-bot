@@ -250,6 +250,58 @@ def blocking_attempts(open_attempts, retry_of: str) -> list:
             if a.unresolved and not (retry_of and a.run_id == retry_of)]
 
 
+FINISHABLE_OWES = {"dev integration", "the image"}
+REFUSED = re.compile(r"-> 4\d\d\b")     # GitHubError text for an HTTP 4xx answer (gh.py request)
+
+
+def _finishable(att: Attempt) -> bool:
+    """A released attempt whose only debts are the ones `finish` pays."""
+    return att.past_commit_point and bool(att.owes) and set(att.owes) <= FINISHABLE_OWES
+
+
+def _dispatch_finish(ctx: Ctx, number: int, att: Attempt) -> None:
+    """Dispatch `finish` for this attempt at most once. The claim is written BEFORE the send, as
+    the retry's is: a run lost between the two leaves a claim naming itself, and no later run
+    sends a second finish on top of one that may be running."""
+    # Runs of this workflow share one concurrency group, so the run that wrote a claim has ended
+    # before this one reads it. A claim with no run id, or a finish run that ended with the
+    # attempt still owing, will not resolve by waiting: it stops this run, never a silent pass.
+    if att.finish_run.startswith("dispatching:"):
+        claimant = att.finish_run.split(":", 1)[1]
+        raise Stop("observe", f"finish of attempt {att.run_id} was claimed by run {claimant}, "
+                   f"which recorded no finish run id.",
+                   f"Check run {claimant}. If it started no `finish`, dispatch `finish` with "
+                   f"attempt {att.run_id} by hand; if it did, wait for that run.")
+    if att.finish_run:
+        run = ctx.bot_gh.run(BOT, int(att.finish_run))
+        if run.get("status") != "completed":
+            ctx.summary(f"\nfinish run {att.finish_run} for attempt {att.run_id} is in flight.")
+            return
+        raise Stop("observe", f"finish run {att.finish_run} for attempt {att.run_id} ended "
+                   f"({run.get('conclusion')}) and the attempt still owes {', '.join(att.owes)}.",
+                   f"Open that run, fix its cause, then dispatch `finish` with attempt "
+                   f"{att.run_id} by hand.")
+    att.finish_run = f"dispatching:{ctx.run_id}"
+    ctx.save_attempt(number, att)
+    try:
+        run_id = ctx.bot_gh.dispatch(BOT, RELEASE_WORKFLOW, "main",
+                                     {"mode": "finish", "attempt": att.run_id})
+    except GitHubError as exc:
+        # Only a definite refusal (an HTTP 4xx answer) proves nothing was started; a network
+        # error or a 5xx may have been accepted with its reply lost, so the claim stays.
+        if REFUSED.search(str(exc)):
+            att.finish_run = ""
+            ctx.save_attempt(number, att)
+        raise Stop("observe", f"attempt {att.run_id} owes only {', '.join(att.owes)}, but the "
+                   f"finish dispatch failed: {exc}",
+                   f"Dispatch `finish` with attempt {att.run_id} by hand"
+                   + ("." if not att.finish_run else f" after checking that run "
+                      f"{ctx.run_id} started none.")) from None
+    att.finish_run = str(run_id)
+    ctx.save_attempt(number, att)
+    ctx.summary(f"\nfinishing attempt {att.run_id} (issue #{number}): finish run {run_id}.")
+
+
 def stage_plan(ctx: Ctx) -> int:
     """Check access, refuse an unresolved attempt, read upstream, and (in `full`) push the
     candidate. Everything before the first push happens here, so a run that is going to stop
@@ -279,6 +331,13 @@ def stage_plan(ctx: Ctx) -> int:
 
     if ctx.mode == "full":
         blocking = blocking_attempts(ctx.open_attempts(), ctx.retry_of)
+        if blocking and all(_finishable(a) for _, a in blocking):
+            # Released attempts that owe only the dev integration and the image: what a person
+            # would do is dispatch `finish`, so this run does it, once per attempt, and stops.
+            for n, a in blocking:
+                _dispatch_finish(ctx, n, a)
+            ctx.out(proceed="false")
+            return 0
         if blocking:
             lines = [f"- issue #{n}: attempt {a.run_id}, state `{a.state}`"
                      + (f", still owes {', '.join(a.owes)}" if a.owes else "")
