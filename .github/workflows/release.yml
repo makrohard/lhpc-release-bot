@@ -203,6 +203,9 @@ jobs:
     # Not `always()`: closing an attempt is the one thing a CANCELLED run must never do. An
     # operator who stops a run wants what it did left visible and repairable, not tidied away.
     if: ${{ !cancelled() && needs.release.result == 'success' }}
+    permissions:
+      contents: write           # the auto-thaw of a proved, expired hold in policy.toml
+      issues: write
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -288,6 +291,9 @@ jobs:
     # nothing is owed.
     needs: [finish-integrate, finish-image]
     if: ${{ always() && inputs.mode == 'finish' }}
+    permissions:
+      contents: write           # the auto-thaw of a proved, expired hold in policy.toml
+      issues: write
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:

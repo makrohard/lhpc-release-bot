@@ -107,3 +107,34 @@ def test_only_the_unfrozen_input_of_a_mixed_run_is_eligible():
                 examine(src(A, path="src/free"), {"track": "tip"}, FakeRemote([A, B]))]
     moved = [f for f in findings if f.moves]
     assert [f.key for f in moved] == ["src/free"]
+
+
+# ---- a hold this bot wrote expires (`held_until`); a person's freeze never does ----
+
+@pytest.mark.parametrize("today, frozen", [("2026-10-22", True), ("2026-10-23", False),
+                                          ("2026-11-30", False)])
+def test_a_bot_hold_holds_until_its_date_and_then_the_pin_moves_again(monkeypatch, today, frozen):
+    from bot import upstream
+    monkeypatch.setattr(upstream, "today", lambda: today)
+    rule = {"track": "tip", "freeze": HELD, "held_until": "2026-10-23"}
+    assert (freeze_of(rule, "src/x")[0] == HELD) is frozen
+    assert examine(src(A), rule, FakeRemote([A, B])).moves is not frozen
+
+
+def test_a_persons_freeze_never_expires(monkeypatch):
+    from bot import upstream
+    monkeypatch.setattr(upstream, "today", lambda: "2099-01-01")
+    assert freeze_of({"track": "tip", "freeze": HELD}, "src/x") == (HELD, "")
+
+
+@pytest.mark.parametrize("rule", [{"track": "tip", "held_until": "2026-10-23"},
+                                  {"track": "tip", "freeze": HELD, "held_until": "next week"},
+                                  {"track": "tip", "freeze": HELD, "held_until": "2026-13-45"}])
+def test_a_malformed_held_until_is_a_policy_problem(rule):
+    assert policy_gaps({"source": {"src/x": rule}}, ["src/x"])
+
+
+def test_a_bot_hold_whose_date_has_passed_lets_the_pin_move():
+    # No clock seam: a date long past. On a bot that knew no expiry this input stayed frozen.
+    rule = {"track": "tip", "freeze": HELD, "held_until": "2000-01-01"}
+    assert examine(src(A), rule, FakeRemote([A, B])).moves

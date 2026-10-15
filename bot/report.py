@@ -123,7 +123,7 @@ def failure_issue(*, stage: str, run_url: str, attempt, findings, observed: str,
     return title, "\n".join(body)
 
 
-def incident(att, keys: dict, run_url: str) -> str:
+def incident(att, keys: dict, run_url: str, until: str = "") -> str:
     """The body of an automatic-freeze incident: what is held, why, and how to lift it.
 
     It has to answer one question weeks later — is this still needed? — so it names the rejected
@@ -148,7 +148,12 @@ def incident(att, keys: dict, run_url: str) -> str:
         "prove every stack — including the held one — before anything is published. Whether it "
         "was actually dispatched is appended below; nothing above this line asserts it.",
         "",
-        "**This does not expire.** Neither a newer upstream release nor closing this issue lifts "
-        "it. When the upstream fix is verified, delete the `freeze` lines named above from "
-        "`policy.toml` and let the next run prove the result.",
+        (f"**The hold expires on {until}** (`held_until`). From then on the held inputs move "
+         f"again and the next run proves them: a green release that moved them deletes the hold "
+         f"and closes this issue; an attributable regression that holds them again renews it for "
+         f"another week, and an unmarked red leaves it expired. To lift it sooner, delete its "
+         f"`freeze` and `held_until` lines from `policy.toml`." if until else
+         "**This does not expire.** Neither a newer upstream release nor closing this issue lifts "
+         "it. When the upstream fix is verified, delete the `freeze` lines named above from "
+         "`policy.toml` and let the next run prove the result."),
     ])

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from dataclasses import asdict
 from pathlib import Path
 
@@ -1697,6 +1698,62 @@ def _find_image_run(ctx: Ctx, tag: str) -> int:
 # ---------------------------------------------------------------------------- stage: finalize
 
 
+def _thaw_proved(ctx: Ctx, att: Attempt) -> None:
+    """A release that MOVED an input whose bot-written hold had expired has proved it: delete the
+    hold from `policy.toml` and close each incident none of whose holds remain. Best-effort after
+    the release — a thaw that fails leaves an expired hold, which already holds nothing."""
+    try:
+        bot = ctx.clone(BOT, "main", token=ctx.bot_token or ctx.token)
+        policy_p = bot / "policy.toml"
+        policy = up.load_policy(policy_p)
+    except (RuntimeError, OSError, ValueError) as exc:
+        ctx.summary(f"\nThe policy could not be read for a thaw ({exc}); nothing was thawed.")
+        return
+    keys = sorted(set(up.expired_holds(policy)) & set(att.moved_keys))
+    if not keys:
+        return
+
+    def rule(key):
+        return (policy["extra"][key.split(".", 1)[1]] if key.startswith("extra.")
+                else policy["source"][key])
+    incidents = {int(n) for k in keys for n in re.findall(r"/issues/(\d+)", rule(k)["freeze"])}
+    try:
+        thawed = af.thaw_edit(policy_p.read_text(), keys)
+    except (OSError, ValueError) as exc:
+        ctx.summary(f"\nThe proved holds on {', '.join(keys)} could not be thawed ({exc}); "
+                    f"they have expired and hold nothing. Delete their lines by hand.")
+        return
+    left = tomllib.loads(thawed)
+    # Each incident is closed BEFORE the policy is pushed: an incident stays open while a line
+    # naming it is in the policy, so a close that fails leaves both for the next release that
+    # moves the input, never an open incident whose hold is already gone. (An incident closed
+    # before a later one failed is named by an expired line until then: harmless, it holds nothing.)
+    try:
+        for number in sorted(incidents):
+            still = [k for entries in (left.get("source", {}), left.get("extra", {}))
+                     for k, r in entries.items() if f"/issues/{number}" in str(r.get("freeze", ""))]
+            if still:
+                continue
+            ctx.bot_gh.comment(BOT, number, f"Thawed: {', '.join(keys)} moved in {att.version} "
+                                            f"and every required check passed ({ctx.run_url}).")
+            ctx.bot_gh.update_issue(BOT, number, state="closed")
+    except GitHubError as exc:
+        ctx.summary(f"\nThe incidents of the proved holds on {', '.join(keys)} could not be closed "
+                    f"({exc}); nothing was thawed. The holds have expired and hold nothing; the "
+                    f"next release that moves them thaws them again.")
+        return
+    try:
+        policy_p.write_text(thawed)
+        git("add", "policy.toml", cwd=bot)
+        git("commit", "-q", "-m", f"auto-thaw: {', '.join(keys)} proved by {att.version}", cwd=bot)
+        git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=bot)      # never forced
+    except (RuntimeError, OSError) as exc:
+        ctx.summary(f"\nThe proved holds on {', '.join(keys)} could not be thawed ({exc}); "
+                    f"they have expired and hold nothing. Delete their lines by hand.")
+        return
+    ctx.summary(f"\nThawed the proved holds on {', '.join(keys)}.")
+
+
 def stage_finalize(ctx: Ctx) -> int:
     """The ONE place an attempt is closed, and only when nothing is owed.
 
@@ -1718,6 +1775,7 @@ def stage_finalize(ctx: Ctx) -> int:
         return 0
     att.state = "complete"
     ctx.save_attempt(number, att)
+    _thaw_proved(ctx, att)
     report_retry_outcome(ctx, f"released {att.version} with the hold in place — the held stack "
                               f"and every other required case passed", att)
     # A retry that RELEASED has discharged its obligation too. Same settlement as the
@@ -1903,6 +1961,14 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
     return 0
 
 
+HOLD_DAYS = 7      # a hold this bot writes is re-proved after a week; a person's freeze never
+
+
+def _hold_until(days: int) -> str:
+    import datetime
+    return (datetime.date.fromisoformat(up.today()) + datetime.timedelta(days=days)).isoformat()
+
+
 def _auto_freeze(ctx: Ctx, number: int, att: Attempt) -> None:
     """Hold the stack this run's evidence blamed, say so in an incident, and retry once.
 
@@ -1949,13 +2015,17 @@ def _auto_freeze(ctx: Ctx, number: int, att: Attempt) -> None:
     policy_p = bot / "policy.toml"
     keys, refusal = af.decide(att.regression, att.moved_keys, manifest,
                               up.load_policy(policy_p),
-                              unattributed=af.unattributed_failures(att.evidence))
+                              unattributed=af.unattributed_failures(att.evidence),
+                              moved_only=att.evidence.startswith("binary build run"))
     if refusal:
-        print(f"no automatic hold: {refusal}")
+        # In the run's summary, not only on stdout: a refused build hold is the internal-regression
+        # report (a failed build that moved nothing of its own stack).
+        ctx.summary(f"\nno automatic hold: {refusal}")
         return
 
     incident = af.already_open(ctx.bot_gh.open_issues(BOT, af.LABEL), att.regression)
-    body = rp.incident(att, keys, ctx.run_url)
+    until = _hold_until(HOLD_DAYS)
+    body = rp.incident(att, keys, ctx.run_url, until=until)
     if incident:
         ctx.bot_gh.update_issue(BOT, incident, body=body)
     else:
@@ -1971,7 +2041,7 @@ def _auto_freeze(ctx: Ctx, number: int, att: Attempt) -> None:
     reason = (f"Automatic hold after {att.evidence or 'a failed release'}; "
               f"see {BOT_URL}/issues/{incident}")
     try:
-        policy_p.write_text(af.freeze_edit(policy_p.read_text(), keys, reason))
+        policy_p.write_text(af.freeze_edit(policy_p.read_text(), keys, reason, until=until))
         if git("status", "--porcelain", "policy.toml", cwd=bot).strip():
             git("add", "policy.toml", cwd=bot)
             git("commit", "-q", "-m",

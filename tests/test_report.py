@@ -69,3 +69,14 @@ def test_the_opening_names_the_event_that_started_the_run(monkeypatch, retry_of,
     ctx = _Ctx(retry_of=retry_of)
     cli._report_stop(ctx, cli.Stop("prove", "the candidate is not proven", "Recovery restores."))
     assert word in ctx.bot_gh.created[0].splitlines()[0]
+
+
+def test_an_expiring_incident_promises_renewal_only_on_an_attributable_regression():
+    # The same rule as the README: an unmarked red writes no hold, so it renews nothing.
+    from bot import report as rp
+    att = Attempt(run_id="9", version="0.12.10", base_sha="b" * 40, candidate_sha="c" * 40,
+                  regression=["meshcore"])
+    body = rp.incident(att, {"src/openhop-core": "holds meshcore"}, "https://example.invalid/r/9",
+                       until="2026-10-23")
+    assert "attributable regression that holds them again renews" in body
+    assert "an unmarked red leaves it expired" in body and "a red one renews" not in body

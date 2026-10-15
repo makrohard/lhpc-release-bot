@@ -135,8 +135,9 @@ freeze = "Upstream startup regression; hold the tested revision until the fix is
 
 The held value is whatever the controller manifest already pins — it is never copied into policy,
 so there is one source of truth. Every run still reports the input, its hold and what upstream has
-done since, and never counts it as something to move. Delete the line to thaw. There is no expiry:
-time passing is not evidence that the problem is fixed.
+done since, and never counts it as something to move. Delete the line to thaw. A hold you write
+has no expiry: time passing is not evidence that the problem is fixed. Only the holds the bot
+writes itself carry `held_until` (below).
 
 - **Set or lift a hold while the bot is idle.** Policy is read from the revision a run checked
   out, so a change cannot reach an attempt that has already prepared a candidate. Settle any open
@@ -152,7 +153,8 @@ time passing is not evidence that the problem is fixed.
 
 If the release lane fails and its evidence NAMES the stack that failed, the bot holds that
 stack's composition itself, opens an incident and retries once with everything else still
-advancing. It never guesses: it acts only on an assertion the lane marked as that stack's own
+advancing. When the evidence is the binary builder's own (a stack's binary build failed at its
+compile step), only the inputs this candidate MOVED are held; the stack's other inputs keep moving. It never guesses: it acts only on an assertion the lane marked as that stack's own
 install, build, start or readiness, so an infrastructure failure, a cancelled run, or a case that
 failed while stopping its predecessor produces an ordinary failure report and no hold.
 
@@ -189,8 +191,11 @@ exactly one retry. The retry cannot retry — a chain would peel stacks off one 
 something passed. The incident carries the rejected candidate, the retained one and the retry
 link, and it does not block later releases, because by then the attempt is settled.
 
-Lifting it is the same explicit thaw as any other hold. Nothing expires, and a newer upstream
-release is not evidence that the problem is fixed.
+Every hold the bot writes carries `held_until`, seven days later. Until then it holds; from that
+date the input moves again and the next run proves it. A green release that moved it deletes the
+`freeze` and `held_until` lines and closes the incident (`finalize`); an attributable regression
+that holds the input again renews the date, and an unmarked red leaves it expired. To
+lift it sooner, delete both lines, as with any other hold.
 
 **Close the incident when you thaw, not later.** A hold and its incident are two pieces of state,
 and deleting the `freeze` lines without closing the issue leaves a trap that fires on the NEXT

@@ -120,7 +120,8 @@ def unattributed_failures(evidence: str) -> list:
     return sorted({m["case"] for m in UNATTRIBUTED.finditer(evidence or "")})
 
 
-def decide(attributed, moved_keys, manifest_text: str, policy: dict, unattributed=()) -> tuple:
+def decide(attributed, moved_keys, manifest_text: str, policy: dict, unattributed=(),
+           moved_only: bool = False) -> tuple:
     """`(keys_to_hold, refusal)` — what to freeze for these stacks, or why nothing may be.
 
     Five ways this refuses, and every one is a case where a hold would be a guess or a lie:
@@ -154,10 +155,14 @@ def decide(attributed, moved_keys, manifest_text: str, policy: dict, unattribute
     if unmoved:
         return {}, (f"{', '.join(unmoved)} failed but moved nothing this run — a stack that "
                     f"broke with no changed input of its own needs investigation, not a hold")
+    if moved_only:
+        # A BUILD failure is blamed on what changed, not on the stack's whole composition: the
+        # inputs this candidate moved are held, the others keep moving.
+        keys = {k: v for k, v in keys.items() if k in moved}
     return keys, ""
 
 
-def freeze_edit(policy_text: str, keys: dict, reason: str) -> str:
+def freeze_edit(policy_text: str, keys: dict, reason: str, until: str = "") -> str:
     """`policy.toml` with a `freeze` added under each key that has none.
 
     Written under the key's own `track` line, so the entry still reads as what it tracks with a
@@ -183,14 +188,55 @@ def freeze_edit(policy_text: str, keys: dict, reason: str) -> str:
         end = len(text) if end is None else end.start()
         block = text[start:end]
         if re.search(r"^freeze\s*=", block, re.M):
+            # A hold somebody else wrote stays exactly as it is. Only an expiring hold of this
+            # bot's own (one that carries `held_until`) is renewed when it is written again.
+            old_until = re.search(r"^held_until\s*=.*$", block, re.M)
+            if until and old_until:
+                block = block[:old_until.start()] + f'held_until = "{until}"' \
+                    + block[old_until.end():]
+                text = text[:start] + block + text[end:]
             continue
         # json.dumps produces a TOML-compatible basic string, so a quote or a backslash in the
         # reason cannot end the value early and leave a file that does not parse.
         line = f"freeze = {json.dumps(f'{reason} — {keys[key]}')}\n"
+        if until:
+            line += f'held_until = "{until}"\n'
         track = re.search(r"^track\s*=.*\n", block, re.M)
         at = start + (track.end() if track else len(found.group()) + 1)
         text = text[:at] + line + text[at:]
     _verify_edit(policy_text, text, keys)
+    return text
+
+
+def thaw_edit(policy_text: str, keys) -> str:
+    """`policy.toml` without the `freeze` and `held_until` lines of each key — only in entries
+    that carry `held_until` (a hold this bot wrote), never a person's freeze. Parsed and checked
+    like `freeze_edit`."""
+    text = policy_text
+    for key in sorted(keys):
+        header = (f'[source."{key}"]' if not key.startswith("extra.") else f"[{key}]")
+        found = re.search(rf"^{re.escape(header)}[ \t]*$", text, re.M)
+        if not found:
+            raise ValueError(f"policy.toml has no entry {header}")
+        start = found.start()
+        end = re.compile(r"^\[", re.M).search(text, found.end())
+        end = len(text) if end is None else end.start()
+        block = text[start:end]
+        if not re.search(r"^held_until\s*=", block, re.M):
+            continue
+        block = re.sub(r"^(freeze|held_until)\s*=.*\n", "", block, flags=re.M)
+        text = text[:start] + block + text[end:]
+    before, after = tomllib.loads(policy_text), tomllib.loads(text)
+    if set(after) != set(before):
+        raise ValueError("the thaw changed the policy's top-level keys")
+    for key in keys:
+        table, name = (("extra", key.split(".", 1)[1]) if key.startswith("extra.")
+                       else ("source", key))
+        was, now = before[table][name], after[table][name]
+        if "held_until" in was and ("freeze" in now or "held_until" in now):
+            raise ValueError(f"the thaw left the hold on {key}")
+        if now.get("track") != was.get("track"):
+            raise ValueError(f"the thaw changed what {key} tracks")
     return text
 
 

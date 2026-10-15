@@ -164,6 +164,27 @@ def policy_gaps(policy: dict, pinned_paths) -> list:
     return gaps + freeze_problems(policy)
 
 
+HELD_UNTIL = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _is_date(value) -> bool:
+    """A real YYYY-MM-DD calendar date: `2026-13-45` has the shape and is not one."""
+    import datetime
+    if not (isinstance(value, str) and HELD_UNTIL.fullmatch(value)):
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def today() -> str:
+    """The UTC date a hold's `held_until` is compared with. A function so tests can set it."""
+    import datetime
+    return datetime.datetime.now(datetime.UTC).date().isoformat()
+
+
 def freeze_of(rule: dict, key: str) -> tuple:
     """`(reason, problem)` for one policy entry. A nonblank reason is a hold; a problem is fatal.
 
@@ -173,8 +194,13 @@ def freeze_of(rule: dict, key: str) -> tuple:
     and a derived input moves with its owner, so a hold written here would hold nothing while
     reading as though it did.
     """
+    until = rule.get("held_until")
+    if until is not None and "freeze" not in rule:
+        return "", f"{key}: held_until without a freeze"
     if "freeze" not in rule:
         return "", ""
+    if until is not None and not _is_date(until):
+        return "", f"{key}: held_until must be a YYYY-MM-DD date, got {until!r}"
     value = rule["freeze"]
     if not isinstance(value, str) or not value.strip():
         return "", f"{key}: freeze must be a nonblank reason string, got {value!r}"
@@ -184,7 +210,22 @@ def freeze_of(rule: dict, key: str) -> tuple:
         owner = rule.get("owner", "?")
         return "", (f"{key}: freeze its owner {owner} instead — this input moves with that pin, "
                     f"so a hold here would not hold anything")
+    if until is not None and today() >= until:
+        # A hold the BOT wrote expires: the pin moves again, and a green release thaws it. A
+        # person's freeze has no `held_until` and never expires.
+        return "", ""
     return value.strip(), ""
+
+
+def expired_holds(policy: dict) -> list:
+    """The keys whose bot-written hold has expired (`held_until` reached)."""
+    out = []
+    for table in ("source", "extra"):
+        for name, rule in (policy.get(table) or {}).items():
+            until = (rule or {}).get("held_until")
+            if _is_date(until) and today() >= until:
+                out.append(name if table == "source" else f"extra.{name}")
+    return sorted(out)
 
 
 def freeze_problems(policy: dict) -> list:

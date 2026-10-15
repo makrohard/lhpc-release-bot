@@ -364,6 +364,27 @@ def test_a_refused_attribution_neither_opens_an_incident_nor_retries(freeze_ctx)
     assert freeze_ctx.gh.dispatched == [] and not freeze_ctx.bot_gh.issues
 
 
+
+def test_a_build_failure_holds_only_what_it_moved_in_the_exact_policy(freeze_ctx, monkeypatch,
+                                                                      tmp_path):
+    """Builder evidence holds the moved input alone (the lane's evidence holds both, above)."""
+    from bot import cli
+    monkeypatch.setattr(cli.up, "today", lambda: "2026-10-16")
+    cli._auto_freeze(freeze_ctx, 5, _att(evidence="binary build run 77 for meshcore on ccccccccc"))
+    assert (tmp_path / "lhpc-release-bot" / "policy.toml").read_text() == (
+        '[source."src/openhop-core"]\ntrack = "tip"\nfreeze = "Automatic hold after binary build '
+        'run 77 for meshcore on ccccccccc; see https://github.com/makrohard/lhpc-release-bot/'
+        'issues/42 \\u2014 holds meshcore"\nheld_until = "2026-10-23"\n\n'
+        '[source."src/meshcore-cli"]\ntrack = "tag"\n')
+
+
+def test_a_build_failure_that_moved_nothing_of_its_stack_is_reported_not_held(freeze_ctx):
+    from bot import cli
+    cli._auto_freeze(freeze_ctx, 5, _att(evidence="binary build run 77 for meshcore on ccccccccc",
+                                         moved_keys=["src/unrelated"]))
+    assert freeze_ctx.gh.dispatched == [] and not freeze_ctx.bot_gh.issues
+    assert any("no automatic hold" in s for s in freeze_ctx.summaries)
+
 # ------------------------------------------------------------------ the cascade the lane warns of
 
 def test_an_unexplained_failure_beside_a_marked_one_refuses():
@@ -1620,3 +1641,96 @@ def test_a_hand_run_finish_still_tells_the_incident_what_happened(tmp_path):
     assert any("Retry 200:" in b and "released" in b for b in said), \
         f"the incident must be told, with the CHILD's id, not the finish run's: {said}"
     assert not any("Retry 900:" in b for b in said), "never the finish run's own id"
+
+
+# ---- the hold a BUILD failure writes, its expiry, and its thaw ----
+
+PTEXT = ('[source."src/openhop-core"]\ntrack = "tip"\n\n'
+         '[source."src/meshcore-cli"]\ntrack = "tag"\nfreeze = "a person\'s hold"\n')
+
+
+def test_a_build_failure_holds_only_the_inputs_the_candidate_moved():
+    keys, refusal = af.decide(["meshcore"], ["src/openhop-core"], MANIFEST, POLICY,
+                              moved_only=True)
+    assert (sorted(keys), refusal) == (["src/openhop-core"], "")
+    # The lane's own attribution keeps holding the stack's whole composition (control).
+    lane, _ = af.decide(["meshcore"], ["src/openhop-core"], MANIFEST, POLICY)
+    assert sorted(lane) == ["src/meshcore-cli", "src/openhop-core"]
+
+
+def test_an_expiring_hold_is_written_with_its_date_and_renewed_but_a_persons_is_not():
+    held = af.freeze_edit(PTEXT, {"src/openhop-core": "holds meshcore"}, "R", until="2026-10-23")
+    assert ('[source."src/openhop-core"]\ntrack = "tip"\nfreeze = "R \\u2014 holds meshcore"\n'
+            'held_until = "2026-10-23"\n') in held
+    renewed = af.freeze_edit(held, {"src/openhop-core": "x", "src/meshcore-cli": "x"}, "R2",
+                             until="2026-10-30")
+    assert 'held_until = "2026-10-30"' in renewed and "R2" not in renewed
+    assert renewed.count("held_until") == 1          # the person's freeze got no date
+
+
+def test_a_thaw_removes_only_a_bot_hold():
+    held = af.freeze_edit(PTEXT, {"src/openhop-core": "holds meshcore"}, "R", until="2026-10-23")
+    thawed = af.thaw_edit(held, ["src/openhop-core", "src/meshcore-cli"])
+    assert thawed == PTEXT                            # the bot hold is gone, the person's stays
+
+
+class _ThawCtx(FakeCtx):
+    def __init__(self, tmp_path, policy_text):
+        super().__init__(tmp_path)
+        self.bot_token = "t" * 20
+        d = tmp_path / "lhpc-release-bot"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "policy.toml").write_text(policy_text)
+        self.closed = []
+        self.gh.update_issue = lambda repo, n, **f: self.closed.append((n, f.get("state")))
+
+    def clone(self, repo, ref="", token=""):
+        return self._tmp / "lhpc-release-bot"
+
+
+def test_a_green_release_that_moved_an_expired_hold_thaws_it_and_closes_its_incident(
+        tmp_path, monkeypatch):
+    from bot import cli, upstream
+    monkeypatch.setattr(upstream, "today", lambda: "2026-10-23")
+    monkeypatch.setattr(cli, "git", lambda *a, **k: "")
+    policy = af.freeze_edit(PTEXT, {"src/openhop-core": "holds meshcore"},
+                            "see https://github.com/x/y/issues/62", until="2026-10-23")
+    ctx = _ThawCtx(tmp_path, policy)
+    cli._thaw_proved(ctx, _att(state="complete", moved_keys=["src/openhop-core"]))
+    assert (tmp_path / "lhpc-release-bot" / "policy.toml").read_text() == PTEXT
+    assert ctx.closed == [(62, "closed")]
+
+
+def _expired(tmp_path, monkeypatch):
+    from bot import cli, upstream
+    monkeypatch.setattr(upstream, "today", lambda: "2026-10-23")
+    monkeypatch.setattr(cli, "git", lambda *a, **k: "")
+    policy = af.freeze_edit(PTEXT, {"src/openhop-core": "holds meshcore"},
+                            "see https://github.com/x/y/issues/62", until="2026-10-23")
+    return _ThawCtx(tmp_path, policy), policy
+
+
+def test_a_thaw_whose_policy_write_fails_reports_and_never_raises(tmp_path, monkeypatch):
+    """Finalize runs the thaw after the attempt is saved complete: a raise here turns a release
+    red."""
+    from bot import cli
+    ctx, _ = _expired(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.Path, "write_text",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("read-only file system")))
+    cli._thaw_proved(ctx, _att(state="complete", moved_keys=["src/openhop-core"]))
+    assert any("could not be thawed (read-only file system)" in s for s in ctx.summaries)
+
+
+def test_an_incident_that_cannot_be_closed_keeps_its_hold_line_for_the_next_release(
+        tmp_path, monkeypatch):
+    """An open incident and its policy line go together, so the next release that moves the
+    input can still find the incident and close it."""
+    from bot import cli
+    ctx, policy = _expired(tmp_path, monkeypatch)
+
+    def refuse(repo, n, **f):
+        raise cli.GitHubError("PATCH /issues/62 -> 502")
+    ctx.gh.update_issue = refuse
+    cli._thaw_proved(ctx, _att(state="complete", moved_keys=["src/openhop-core"]))
+    assert (tmp_path / "lhpc-release-bot" / "policy.toml").read_text() == policy
+    assert any("nothing was thawed" in s for s in ctx.summaries)
