@@ -115,8 +115,10 @@ the channel's typed message and offered the source build. Installed boxes are un
   Releases are cut from `main` only, and changes on `dev` do not influence a release: `dev`'s
   state, a merge-back pull request that is still open included, never gates, delays or shapes one.
 - **Something failed:** one issue **in this repository**, labelled `auto-release`, naming the
-  stage, the run, the observed state, the next action, the pin table with compare links, and
-  whatever diagnostics could be fetched. It lives here rather than in the controller so that a
+  event (scheduled, dispatched or the retry of an attempt), the stage, the run, the observed
+  state, the next action, the pin table with compare links (on a stop after the plan: the inputs
+  the attempt recorded), and whatever diagnostics could be fetched (for a prove stop: each red
+  run's failing jobs with the last lines of their logs). It lives here rather than in the controller so that a
   run whose release credential is the thing that failed can still report; this repository's own
   `GITHUB_TOKEN` writes it. Diagnostics are best-effort; the rest is never omitted.
 

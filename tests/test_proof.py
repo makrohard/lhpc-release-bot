@@ -344,6 +344,10 @@ class _ProveCtx:
     def jobs(self, repo, run_id, attempt=1):
         return list(self._jobs_by_run[int(run_id)])
 
+    def failing_jobs(self, repo, run_id, attempt, lines=20):
+        return [(j["name"], f"https://example.invalid/job/{j['name']}", "E   the last error line")
+                for j in self._jobs_by_run[int(run_id)] if j["conclusion"] != "success"]
+
     def artifact_member(self, repo, run_id, name, member, attempt=1):
         cases = "".join(
             f'<testcase name="{c}">'
@@ -595,3 +599,22 @@ def test_a_testlab_run_without_its_slow_build_job_is_not_proof():
     identity, offlane, outcome = _run_problems(FakeCtx(skipped), att(), "testlab", rec(), run(),
                                                REQUIRED_TESTLAB)
     assert identity == ["slow-build: skipped"] and (offlane, outcome) == ([], [])
+
+
+def test_a_prove_stop_names_each_failing_job_with_its_last_lines():
+    """D7: the diagnostics are links to the red runs with their failing jobs and log tails, not
+    bare run ids."""
+    import pytest
+
+    from bot import cli
+    green = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in cli.REQUIRED_CI]
+    lane = [{"name": "testlab", "conclusion": "success", "head_sha": CAND},
+            {"name": "slow-build", "conclusion": "success", "head_sha": CAND},
+            {"name": cli.LANE_JOB, "conclusion": "failure", "head_sha": CAND}]
+    ctx = _ProveCtx(jobs_by_run={5: green, 6: lane})
+    with pytest.raises(cli.Stop) as stop:
+        cli.stage_prove(ctx)
+    detail = stop.value.detail
+    assert "https://github.com/makrohard/loraham-pi-control/actions/runs/6" in detail
+    assert f"`{cli.LANE_JOB}`" in detail and "the last error line" in detail
+    assert "actions/runs/5" not in detail          # the green CI run is not listed

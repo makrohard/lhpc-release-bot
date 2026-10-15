@@ -90,6 +90,9 @@ class Attempt:
     # the same commit as `main`, and that is still a rehearsal.
     base_ref: str = "main"
     notes: list = field(default_factory=list)
+    # The moved findings as the plan saw them (key, current, candidate, …): the Inputs table of a
+    # report written after the plan, when the stage that stops no longer has the findings.
+    inputs: list = field(default_factory=list)
 
     @property
     def rehearsal(self) -> bool:

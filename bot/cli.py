@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 
 from . import autofreeze as af
@@ -415,7 +416,7 @@ def stage_plan(ctx: Ctx) -> int:
     att = Attempt(run_id=ctx.run_id, state="prepared", version=version, base_sha=base_sha,
                   candidate_sha=candidate, branch=branch, dev_sha=dev_sha,
                   moved_keys=[f.key for f in moved], retry_of=ctx.retry_of,
-                  base_ref=base_ref(),
+                  base_ref=base_ref(), inputs=[asdict(f) for f in moved],
                   notes=[f"moves: {', '.join(f.key for f in moved)}"])
     # The record exists BEFORE the branch is pushed. A push whose reply is lost still happened,
     # and a branch no attempt names is a mutation nothing would ever clean up.
@@ -1065,10 +1066,32 @@ def stage_prove(ctx: Ctx) -> int:
                    + "\n".join(f"- {p}" for p in problems),
                    "Recovery restores whatever this attempt published and deletes the candidate "
                    "branch; nothing was released.",
-                   detail="\n".join(str(r.get("id")) for r in att.runs.values()))
+                   detail=_red_runs(ctx, att))
     ctx.summary(f"every required job succeeded on `{att.candidate_sha[:9]}`, and the release "
                 f"lane ran its cases.")
     return 0
+
+
+def _red_runs(ctx: Ctx, att: Attempt) -> str:
+    """Each recorded run with a failing job: a link, the failing jobs and the end of their logs.
+    What a maintainer opens first; a run whose jobs cannot be read says so instead."""
+    out = []
+    for name, rec in att.runs.items():
+        link = f"https://github.com/{rec['repo']}/actions/runs/{rec['id']}"
+        try:
+            failed = ctx.gh.failing_jobs(rec["repo"], int(rec["id"]), rec.get("attempt", 1))
+        except GitHubError as exc:
+            out.append(f"- {name}: {link} — its jobs could not be read ({exc})")
+            continue
+        if not failed:
+            continue
+        out.append(f"- **{name}**: {link}")
+        for job, url, tail in failed:
+            out.append(f"  - failing job `{job}` {url}".rstrip())
+            if tail:
+                out += ["", "    ```", *("    " + ln for ln in scrub(tail).splitlines()),
+                        "    ```", ""]
+    return "\n".join(out)
 
 
 def _run_problems(ctx: Ctx, att: Attempt, name: str, rec: dict, run: dict,
@@ -1995,6 +2018,15 @@ def _traceback_tail(limit: int = 2000) -> str:
     return "```\n" + traceback.format_exc()[-limit:] + "\n```"
 
 
+def _opening(ctx: Ctx) -> str:
+    """Who stopped, in the report's first words: a retry, a scheduled run or a dispatched one."""
+    if ctx.retry_of:
+        return f"The retry of attempt {ctx.retry_of}"
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
+        return "The scheduled release run"
+    return "The dispatched release run"
+
+
 def _report_stop(ctx: Ctx, stop: Stop) -> None:
     """Always produce a report. Everything that could fail on the way is optional."""
     att, number = Attempt(run_id=ctx.attempt_id), 0
@@ -2013,10 +2045,13 @@ def _report_stop(ctx: Ctx, stop: Stop) -> None:
     if number:
         observed += (f"\n\nThe attempt is issue #{number}, state `{att.state}`"
                      + (f", still owes {', '.join(att.owes)}" if att.owes else "") + ".")
+    # A stage after the plan stops without the findings in hand; the attempt kept them.
+    findings = stop.findings or [up.Finding(**{**d, "consumers": tuple(d.get("consumers") or ())})
+                                 for d in att.inputs]
     title, body = rp.failure_issue(
-        stage=stop.stage, run_url=ctx.run_url, attempt=att, findings=stop.findings,
+        stage=stop.stage, run_url=ctx.run_url, attempt=att, findings=findings,
         observed=observed, next_action=stop.next_action, diagnostics=stop.detail,
-        token_expiry=expiry)
+        token_expiry=expiry, opening=_opening(ctx))
     ctx.summary(f"## Stopped at {stop.stage}\n\n{observed}\n\n{stop.next_action}")
     try:
         marker = f"<!--auto-release:{att.run_id or ctx.run_id}-->"

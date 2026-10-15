@@ -98,11 +98,12 @@ def error_extract(log_text: str, tail: int = 80) -> str:
 
 
 def failure_issue(*, stage: str, run_url: str, attempt, findings, observed: str,
-                  next_action: str, diagnostics: str = "", token_expiry: str = "") -> tuple:
+                  next_action: str, diagnostics: str = "", token_expiry: str = "",
+                  opening: str = "The release run") -> tuple:
     """(title, body). Everything cheap is unconditional; `diagnostics` is what could be
     fetched."""
     title = f"auto-release: stopped at {stage}"
-    body = [f"The scheduled release run stopped at **{stage}**.", "",
+    body = [f"{opening} stopped at **{stage}**.", "",
             f"- run: {run_url}",
             f"- controller `main` at start: `{attempt.base_sha[:9] or '?'}`",
             f"- version it would have released: `{attempt.version or '?'}`",

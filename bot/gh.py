@@ -139,6 +139,24 @@ class GitHub:
                 if attempt else f"/repos/{repo}/actions/runs/{run_id}/jobs")
         return self.get(f"{path}?per_page=100")["jobs"]
 
+    def failing_jobs(self, repo: str, run_id: int, attempt: int, lines: int = 20) -> list:
+        """`(name, url, tail)` for each job of ONE attempt that did not succeed, where `tail` is
+        the last `lines` non-blank lines of its log — "" when the log cannot be read, because a
+        report must never fail on its own diagnostics."""
+        out = []
+        for job in self.jobs(repo, run_id, attempt):
+            if job.get("conclusion") in (None, "success", "skipped", "neutral"):
+                continue
+            try:
+                log = self._signed_download(
+                    f"{self._api}/repos/{repo}/actions/jobs/{job['id']}/logs"
+                ).decode("utf-8", "replace")
+                tail = "\n".join([ln for ln in log.splitlines() if ln.strip()][-lines:])
+            except GitHubError:
+                tail = ""
+            out.append((job.get("name", str(job.get("id"))), job.get("html_url", ""), tail))
+        return out
+
     def cancel(self, repo: str, run_id: int) -> None:
         # Already finished, or already cancelling: both are the state we wanted.
         with contextlib.suppress(GitHubError):
