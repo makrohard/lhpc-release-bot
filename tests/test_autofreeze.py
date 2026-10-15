@@ -662,6 +662,9 @@ class _RedBuilderGh(FakeGh):
         # The VISIBLE name the builder writes; a dotfile would never have survived the upload.
         return self.marker if suffix.endswith(".regression") else b""
 
+    def failing_jobs(self, repo, run_id, attempt, lines=20):
+        return [("build", f"https://example.invalid/job/{run_id}", "ERROR: firmware compile failed")]
+
     def file_at(self, repo, path, sha):
         return BUILD_MANIFEST
 
@@ -1734,3 +1737,15 @@ def test_an_incident_that_cannot_be_closed_keeps_its_hold_line_for_the_next_rele
     cli._thaw_proved(ctx, _att(state="complete", moved_keys=["src/openhop-core"]))
     assert (tmp_path / "lhpc-release-bot" / "policy.toml").read_text() == policy
     assert any("nothing was thawed" in s for s in ctx.summaries)
+
+
+def test_a_failed_build_names_its_failing_job_and_last_lines(tmp_path, monkeypatch):
+    """The gate a firmware or runner move failed on is in the report without opening the run."""
+    from bot import cli
+    monkeypatch.setenv("BINARY_STACK", "meshtastic")
+    monkeypatch.setattr(cli, "MANIFEST", "m.toml")
+    monkeypatch.setattr(cli.up, "load_policy", lambda p: BUILD_POLICY)
+    ctx = _BuildCtx(tmp_path, b"")
+    with pytest.raises(cli.Stop) as stop:
+        cli.stage_build(ctx)
+    assert "`build`" in stop.value.detail and "firmware compile failed" in stop.value.detail

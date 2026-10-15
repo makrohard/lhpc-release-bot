@@ -854,10 +854,14 @@ def stage_build(ctx: Ctx) -> int:
             att.evidence = (f"binary build run {run_id} for {stack} on "
                             f"{att.candidate_sha[:9]}")
             ctx.save_attempt(number, att)
+        # The failing gate (the builder's compile, its smoke boot, …) is named by the job and its
+        # last log lines — what a firmware or runner move failed on, without opening the run.
         raise Stop("build", f"the {stack} binary build did not succeed "
                    f"({run.get('conclusion')}).",
                    "Recovery restores the index for whatever this attempt published; nothing "
-                   "was released.", detail=run.get("html_url", ""))
+                   "was released.",
+                   detail=_red_runs(ctx, {f"binary:{stack}": att.runs[f"binary:{stack}"]})
+                   or run.get("html_url", ""))
     if not entry:
         raise Stop("build", f"the {stack} build reported success but published no fragment this "
                    f"attempt can claim.",
@@ -1126,17 +1130,17 @@ def stage_prove(ctx: Ctx) -> int:
                    + "\n".join(f"- {p}" for p in problems),
                    "Recovery restores whatever this attempt published and deletes the candidate "
                    "branch; nothing was released.",
-                   detail=_red_runs(ctx, att))
+                   detail=_red_runs(ctx, att.runs))
     ctx.summary(f"every required job succeeded on `{att.candidate_sha[:9]}`, and the release "
                 f"lane ran its cases.")
     return 0
 
 
-def _red_runs(ctx: Ctx, att: Attempt) -> str:
+def _red_runs(ctx: Ctx, runs: dict) -> str:
     """Each recorded run with a failing job: a link, the failing jobs and the end of their logs.
     What a maintainer opens first; a run whose jobs cannot be read says so instead."""
     out = []
-    for name, rec in att.runs.items():
+    for name, rec in runs.items():
         link = f"https://github.com/{rec['repo']}/actions/runs/{rec['id']}"
         try:
             failed = ctx.gh.failing_jobs(rec["repo"], int(rec["id"]), rec.get("attempt", 1))
