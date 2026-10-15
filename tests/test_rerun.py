@@ -387,3 +387,107 @@ def test_the_time_spent_classifying_counts_against_the_bound(clock):
     got = g.wait("o/r", 77, 200, poll_s=30)
     assert g.posts == []
     assert got["run_attempt"] == 1 and "rerun" not in got
+
+
+# ---- the one re-run mechanism: typed external transfer failures (decision c1) ----
+
+from bot.cli import external_whats  # noqa: E402
+
+TYPED = "AssertionError: EXTERNAL-UNAVAILABLE what=binary:meshcom\nurlopen error [Errno -3]"
+
+
+def junit(*failures, tag="failure"):
+    cases = "".join(f'<testcase name="c{i}"><{tag} message="{m}">{m}</{tag}></testcase>'
+                    for i, m in enumerate(failures))
+    return f"<testsuite>{cases}<testcase name='ok'/></testsuite>".encode()
+
+
+@pytest.mark.parametrize("doc, whats", [
+    (junit(TYPED), ["binary:meshcom"]),
+    (junit(TYPED, tag="error"), ["binary:meshcom"]),                   # a setup error counts
+    (junit(TYPED, "Failed: EXTERNAL-UNAVAILABLE what=deb:graywolf"), ["binary:meshcom",
+                                                                      "deb:graywolf"]),
+    (b"", []),                                                         # no evidence
+    (b"<testsuite><testcase name='ok'/></testsuite>", []),             # red job, no failure
+    (junit(TYPED, "AssertionError: assert 1 == 2"), []),              # one real failure
+    (junit(TYPED + "\nSTACK-REGRESSION stack=kiss phase=start"), []),  # both: not external
+    (junit("EXTERNAL-UNAVAILABLE what=Binary"), []),                  # not the grammar
+    (b"<testsuite", []),                                               # unreadable
+])
+def test_only_a_junit_whose_every_failure_is_a_typed_transfer_is_external(doc, whats):
+    assert external_whats(doc) == whats
+
+
+class Scripted(ghmod.GitHub):
+    """One run whose attempts end as scripted; a re-run POST starts the next attempt."""
+
+    def __init__(self, outcomes, lost_on=()):
+        super().__init__("t")
+        self.outcomes, self.attempt, self.posts, self.lost_on = outcomes, 1, [], set(lost_on)
+
+    def run(self, repo, run_id):
+        return {"id": 77, "status": "completed", "run_attempt": self.attempt,
+                "conclusion": self.outcomes[self.attempt - 1]}
+
+    def runner_lost(self, repo, run):
+        return ["testlab"] if run["run_attempt"] in self.lost_on else []
+
+    def request(self, method, path, body=None, accept="application/vnd.github+json"):
+        assert method == "POST" and path == RERUN
+        self.posts.append(self.attempt)
+        self.attempt += 1
+
+
+def external_until(n):
+    """The external classifier of a lane that is red on a transfer until attempt `n`."""
+    return lambda run: ["release-verify: binary:meshcom"] if run["run_attempt"] < n else []
+
+
+def test_a_pure_external_red_is_re_run_at_once_and_the_green_attempt_is_judged(clock):
+    g = Scripted(["failure", "success"])
+    got = g.wait("o/r", 77, 6000, external=external_until(2))
+    assert (g.posts, got["run_attempt"], got["conclusion"]) == ([1], 2, "success")
+    assert got["reruns"] == [{"attempt": 1, "jobs": ["release-verify: binary:meshcom"],
+                              "reason": "external"}]
+    assert "external_unresolved" not in got
+
+
+def test_five_external_re_runs_mean_six_attempts_and_then_unproven(clock):
+    g = Scripted(["failure"] * 6)
+    got = g.wait("o/r", 77, 100_000, external=external_until(99))
+    assert g.posts == [1, 2, 3, 4, 5] and got["run_attempt"] == 6
+    assert clock[0] == sum(ghmod.EXTERNAL_WAITS) + 5 * 30   # the waits + one poll per re-run
+    assert got["external_unresolved"] == ["release-verify: binary:meshcom"]
+
+
+def test_a_runner_loss_and_external_failures_share_one_cap(clock):
+    # Attempt 1 lost its runner (re-run at once, once); attempts 2–5 failed on a transfer
+    # (waits 0, 1, 2, 5 min: the EXTERNAL index starts at its own 0); attempt 6 still did:
+    # five re-runs in all, then unproven.
+    g = Scripted(["failure"] * 6, lost_on={1})
+    got = g.wait("o/r", 77, 100_000, external=external_until(99))
+    assert g.posts == [1, 2, 3, 4, 5]
+    assert [r["reason"] for r in got["reruns"]] == ["runner-lost"] + ["external"] * 4
+    assert clock[0] == sum(ghmod.EXTERNAL_WAITS[:4]) + 5 * 30
+    assert got["external_unresolved"]
+
+
+
+def test_a_runner_loss_after_an_external_re_run_is_judged_as_it_is(clock):
+    # Runner loss is re-run on the first attempt only; attempt 3 losing its runner is a red.
+    g = Scripted(["failure"] * 4, lost_on={3})
+    got = g.wait("o/r", 77, 100_000, external=external_until(3))
+    assert g.posts == [1, 2] and got["run_attempt"] == 3 and got["conclusion"] == "failure"
+
+def test_no_external_re_run_when_its_wait_and_the_last_attempt_no_longer_fit(clock):
+    # Attempt 1 took 0 s here; the second external re-run waits 60 s, and only 30 s are left.
+    g = Scripted(["failure"] * 3)
+    got = g.wait("o/r", 77, 30, external=external_until(99))
+    assert g.posts == [1]                               # the first (0 s wait) still fitted
+    assert got["external_unresolved"]
+
+
+def test_a_job_that_is_not_purely_external_is_never_re_run(clock):
+    g = Scripted(["failure", "success"])
+    got = g.wait("o/r", 77, 6000, external=lambda run: [])
+    assert g.posts == [] and got["conclusion"] == "failure" and "external_unresolved" not in got

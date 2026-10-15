@@ -26,6 +26,10 @@ TERMINAL = ("completed",)
 # GitHub's own words for a job whose runner went away. Nothing else counts as runner loss.
 RUNNER_LOST = ("The runner has received a shutdown signal", "lost communication with the server",
                "was not acquired by Runner")
+# The waits before each re-run of a job that failed only on an external transfer (decision c1:
+# at once, then growing), and the cap on re-runs of any kind in one wait.
+EXTERNAL_WAITS = (0, 60, 120, 300, 600)
+MAX_RERUNS = 5
 
 
 class GitHubError(RuntimeError):
@@ -163,38 +167,70 @@ class GitHub:
             self.request("POST", f"/repos/{repo}/actions/runs/{run_id}/cancel")
 
     def wait(self, repo: str, run_id: int, timeout_s: float, poll_s: float = 30.0,
-             rerun: bool = True) -> dict:
+             rerun: bool = True, external=None) -> dict:
         """Block until the run is terminal. A timeout returns the run as it stands — the caller
         must then settle the writer, because a run that timed out here is still running there.
 
-        A first attempt that only lost a runner (`runner_lost`) has its failed jobs re-run ONCE
-        and is waited on again under the same id; the returned run then carries `rerun`
-        (the attempt that was re-run and its lost jobs). Any other red comes back as it is.
-        ONE bound covers both attempts — the caller's job has its own timeout around it — so a
-        re-run is asked for only while the time left is at least the time already spent.
+        ONE re-run mechanism, two reasons, re-running only the failed jobs of the attempt just
+        judged and waiting again under the same id:
+          * `runner-lost` — the first attempt THIS wait judges (no re-run made yet), when its
+            failed jobs only lost their runner (`runner_lost`, which also refuses any
+            `run_attempt` but 1): once, at once;
+          * `external` — every failed job is one `external(run)` names (typed transfer failures
+            only; the caller reads the evidence): after waits of `EXTERNAL_WAITS`, one per such
+            re-run.
+        At most `MAX_RERUNS` re-runs of either kind, and ONE bound covers every attempt: a re-run
+        is asked only while the time left covers its wait plus the duration of the attempt just
+        judged. The returned run carries `rerun` (the last re-run: the attempt re-run and its
+        jobs) and `reruns` (each, with its reason); when the last attempt still failed only on
+        an external transfer, `external_unresolved` names the jobs.
         `rerun=False` for runs that are being settled, not judged."""
         start = time.monotonic()
-        deadline, reran = start + timeout_s, None
+        deadline, attempt_start, reruns = start + timeout_s, start, []
         while True:
             run = self.run(repo, run_id)
-            if reran:
-                run["rerun"] = reran
+            if reruns:
+                run["rerun"] = {"attempt": reruns[-1]["attempt"], "jobs": reruns[-1]["jobs"]}
+                run["reruns"] = [dict(r) for r in reruns]
             # After the re-run request the run still reads as the old, finished attempt until
             # GitHub has started the new one; that old answer is not the result.
             done = (run.get("status") in TERMINAL
-                    and not (reran and run.get("run_attempt", 1) <= reran["attempt"]))
+                    and not (reruns and run.get("run_attempt", 1) <= reruns[-1]["attempt"]))
             if done:
-                lost = [] if (reran or not rerun) else self.runner_lost(repo, run)
+                if not rerun:
+                    return run
+                reason, jobs = "", []
+                if not reruns:                  # the first attempt this wait judges, only
+                    jobs = self.runner_lost(repo, run)
+                    reason = "runner-lost" if jobs else ""
+                if not reason and external is not None and run.get("conclusion") == "failure":
+                    jobs = external(run)
+                    reason = "external" if jobs else ""
+                if not reason:
+                    return run
+                done_external = sum(r["reason"] == "external" for r in reruns)
+                wait_s = EXTERNAL_WAITS[done_external] if (
+                    reason == "external" and done_external < len(EXTERNAL_WAITS)) else 0
                 # Measured AFTER the classification: its HTTP calls spend the same bound.
                 now = time.monotonic()
-                if not lost or deadline - now < now - start:
+                if (len(reruns) >= MAX_RERUNS
+                        or (reason == "external" and done_external >= len(EXTERNAL_WAITS))
+                        or deadline - now < wait_s + (now - attempt_start)):
+                    if reason == "external":
+                        run["external_unresolved"] = jobs
                     return run
+                if wait_s:
+                    time.sleep(wait_s)
                 try:
                     self.request("POST", f"/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs")
                 except GitHubError as exc:
                     run["rerun_error"] = str(exc)
+                    if reason == "external":
+                        run["external_unresolved"] = jobs
                     return run
-                reran = {"attempt": run.get("run_attempt", 1), "jobs": lost}
+                reruns.append({"attempt": run.get("run_attempt", 1), "jobs": jobs,
+                               "reason": reason})
+                attempt_start = time.monotonic()
             elif time.monotonic() >= deadline:
                 run["timed_out"] = True
                 return run

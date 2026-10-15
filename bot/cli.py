@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import zipfile
 from dataclasses import asdict
 from pathlib import Path
 
@@ -198,18 +199,79 @@ class Ctx:
 # ---------------------------------------------------------------------------- stage: plan
 
 
-def _wait(ctx, rec: dict, bound: float, att: Attempt | None = None, number: int = 0) -> dict:
+# The lane's typed transfer failure (the contract with the testlab lanes, determinism M4): the
+# first line of an assertion message, searched in the failure's message and text.
+EXTERNAL = re.compile(r"EXTERNAL-UNAVAILABLE what=([a-z0-9][a-z0-9_.:-]*)(?=\s|$)")
+# The only jobs that write a JUnit the bot can read per attempt: (artifact, member).
+EXTERNAL_JUNIT = {"release-verify": ("testlab-logs-release-verify", "junit-release.xml"),
+                  "slow-build": ("slow-build-evidence", "junit-slow-build.xml")}
+
+
+def external_whats(junit: bytes) -> list:
+    """The `what=` of every failing case when EVERY failure and error in this JUnit is a typed
+    external transfer and none carries a regression marker; [] otherwise — no JUnit, no failure
+    at all, an unreadable file, or one failure that is anything else."""
+    if not junit:
+        return []
+    import xml.etree.ElementTree as ET  # noqa: S405
+    try:
+        root = ET.fromstring(junit)     # noqa: S314
+    except ET.ParseError:
+        return []
+    whats = []
+    for case in root.iter("testcase"):
+        for bad in (e for e in case if e.tag in ("failure", "error")):
+            text = (bad.get("message") or "") + "\n" + (bad.text or "")
+            found = EXTERNAL.search(text)
+            if not found or af.REGRESSION.search(text):
+                return []
+            whats.append(found.group(1))
+    return whats
+
+
+def _external_jobs(ctx, rec: dict, run: dict) -> list:
+    """`<job>: <what>` for each failed job of this attempt when EVERY failed job is one with a
+    JUnit and failed only on typed external transfers; [] otherwise (nothing to re-run)."""
+    attempt = run.get("run_attempt", 1)
+    try:
+        failed = [j for j in ctx.gh.jobs(rec["repo"], int(rec["id"]), attempt)
+                  if j.get("conclusion") not in ("success", "skipped", "neutral")]
+        out = []
+        for job in failed:
+            where = EXTERNAL_JUNIT.get(job.get("name", ""))
+            if not where or job.get("conclusion") != "failure":
+                return []
+            whats = external_whats(ctx.gh.artifact_member(rec["repo"], int(rec["id"]),
+                                                          where[0], where[1], attempt))
+            if not whats:
+                return []
+            out += [f"{job['name']}: {w}" for w in whats]
+    except (GitHubError, zipfile.BadZipFile):
+        return []               # evidence that cannot be read is no transfer failure: a red
+    return out
+
+
+def _wait(ctx, rec: dict, bound: float, att: Attempt | None = None, number: int = 0,
+          external: bool = False) -> dict:
     """The one wait for a run this bot judges. When GitHub re-ran a first attempt that lost its
     runner (`GitHub.wait`), the record moves to the new attempt — every judge compares the run
     against the attempt recorded — and the re-run is written down where a maintainer reads."""
-    run = ctx.gh.wait(rec["repo"], int(rec["id"]), bound)
+    run = (ctx.gh.wait(rec["repo"], int(rec["id"]), bound,
+                       external=lambda r: _external_jobs(ctx, rec, r))
+           if external else ctx.gh.wait(rec["repo"], int(rec["id"]), bound))
     if run.get("rerun"):
         # The attempt THIS bot asked for, not whatever GitHub reports now: a third attempt
         # somebody else started is not the one judged, and the identity check must say so.
         rec["attempt"] = run["rerun"]["attempt"] + 1
-        note = (f"{rec['repo']} run {rec['id']}: attempt {run['rerun']['attempt']} lost its "
-                f"runner ({', '.join(run['rerun']['jobs'])}); the failed jobs were re-run once "
-                f"and attempt {rec['attempt']} is the one judged")
+        steps = run.get("reruns") or [dict(run["rerun"], reason="runner-lost")]
+        said = {"runner-lost": "lost its runner", "external": "failed on an external transfer"}
+        note = (f"{rec['repo']} run {rec['id']}: "
+                + "; ".join(f"attempt {s['attempt']} {said.get(s.get('reason'), 'failed')} "
+                            f"({', '.join(s['jobs'])})" for s in steps)
+                + (f"; the failed jobs were re-run once and attempt {rec['attempt']} is the one judged"
+                   if len(steps) == 1 else
+                   f"; the failed jobs were re-run {len(steps)} times and attempt "
+                   f"{rec['attempt']} is the one judged"))
     elif run.get("rerun_error"):
         note = (f"{rec['repo']} run {rec['id']} lost its runner, but the re-run was refused: "
                 f"{run['rerun_error']}")
@@ -1137,9 +1199,26 @@ def stage_prove(ctx: Ctx) -> int:
         if not rec:
             identity.append(f"{name}: this attempt never recorded a run")
             continue
-        run = _wait(ctx, rec, bound, att, number)
+        run = _wait(ctx, rec, bound, att, number, external=(name == "testlab"))
         got_identity, got_offlane, got_outcome = _run_problems(ctx, att, name, rec, run,
                                                                 required)
+        if name == "testlab" and not run.get("timed_out"):
+            # A transfer that stayed unavailable through every re-run proves nothing either way:
+            # `unproven, external` — in identity, so it can never attribute a stack. It is
+            # retried by the next scheduled run, and its gate is reported as degraded.
+            unresolved = run.get("external_unresolved") or []
+            if unresolved:
+                identity.append("testlab: unproven, external — " + "; ".join(unresolved))
+            # A gate is examined only when its job succeeded on the attempt judged: a job that
+            # was red for any other reason says nothing about the outage, so it closes nothing.
+            try:
+                green = {j.get("name") for j in ctx.gh.jobs(LHPC, int(rec["id"]),
+                                                            run.get("run_attempt", 1))
+                         if j.get("conclusion") == "success"}
+            except GitHubError:
+                green = set()           # a report that cannot be read closes nothing
+            _degraded(ctx, "gate", {u.split(":", 1)[0]: u for u in unresolved},
+                      examined=set(EXTERNAL_JUNIT) & green)
         # A measured red OUTSIDE the release lane disqualifies an attribution exactly as a broken
         # identity does, so it joins the same list here: the lane did not name it, and holding an
         # upstream pin for it would freeze the wrong project.

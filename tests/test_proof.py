@@ -6,6 +6,8 @@ loudly as one that proved something. Each case here is one of those mistakes.
 """
 from __future__ import annotations
 
+import pytest
+
 from bot.attempt import Attempt
 from bot.cli import (
     LANE_JOB,
@@ -305,12 +307,12 @@ def _split(**over):
 class _ProveCtx:
     """Only what `stage_prove` reaches for. The GitHub seam is the only thing faked."""
 
-    attempt_id = "1"
+    attempt_id = run_id = "1"
     run_url = "https://example.invalid/run/1"
 
     def __init__(self, *, jobs_by_run):
         from bot.attempt import Attempt
-        self.gh = self
+        self.gh = self.bot_gh = self
         self._jobs_by_run = jobs_by_run
         self.summaries, self.saved = [], []
         self.att = Attempt(run_id="1", version="0.3.7", base_sha="b" * 40, candidate_sha=CAND,
@@ -335,7 +337,7 @@ class _ProveCtx:
     def dispatch(self, repo, workflow, ref, inputs=None):
         return 6
 
-    def wait(self, repo, run_id, bound):
+    def wait(self, repo, run_id, bound, external=None):
         # A run is red whenever any of its jobs is, which is what GitHub does.
         red = any(j["conclusion"] != "success" for j in self._jobs_by_run[int(run_id)])
         return {"head_sha": CAND, "workflow_id": 42, "run_attempt": 1,
@@ -343,6 +345,13 @@ class _ProveCtx:
 
     def jobs(self, repo, run_id, attempt=1):
         return list(self._jobs_by_run[int(run_id)])
+
+    def open_issues(self, repo, label):
+        return []
+
+    def create_issue(self, repo, title, body, labels):
+        self.summaries.append(f"issue: {title}")
+        return {"number": 1}
 
     def failing_jobs(self, repo, run_id, attempt, lines=20):
         return [(j["name"], f"https://example.invalid/job/{j['name']}", "E   the last error line")
@@ -618,3 +627,126 @@ def test_a_prove_stop_names_each_failing_job_with_its_last_lines():
     assert "https://github.com/makrohard/loraham-pi-control/actions/runs/6" in detail
     assert f"`{cli.LANE_JOB}`" in detail and "the last error line" in detail
     assert "actions/runs/5" not in detail          # the green CI run is not listed
+
+
+def test_an_external_outage_that_outlasted_the_re_runs_is_unproven_and_blames_nobody():
+    """The lane's red is only a transfer that stayed unavailable: the attempt stops, nothing is
+    attributed (so nothing is held), and the reason says `unproven, external`."""
+    import pytest
+
+    from bot import cli
+    green = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in cli.REQUIRED_CI]
+    lane = [{"name": "testlab", "conclusion": "success", "head_sha": CAND},
+            {"name": "slow-build", "conclusion": "success", "head_sha": CAND},
+            {"name": cli.LANE_JOB, "conclusion": "failure", "head_sha": CAND}]
+
+    class _Outage(_ProveCtx):
+        def wait(self, repo, run_id, bound, external=None):
+            run = super().wait(repo, run_id, bound)
+            if int(run_id) == 6:
+                run["external_unresolved"] = ["release-verify: binary:meshcom"]
+            return run
+
+        def artifact_member(self, repo, run_id, name, member, attempt=1):
+            # What the lane writes on an outage: a typed transfer failure, never a marker.
+            return EXTERNAL_JUNIT
+
+    ctx = _Outage(jobs_by_run={5: green, 6: lane})
+    with pytest.raises(cli.Stop) as stop:
+        cli.stage_prove(ctx)
+    assert ctx.att.regression == []
+    assert any(line.startswith("- testlab: unproven, external") for line in
+               stop.value.observed.splitlines())
+
+
+EXTERNAL_JUNIT = (b'<testsuite><testcase name="test_release_kiss"><failure message="EXTERNAL-'
+                  b'UNAVAILABLE what=binary:meshcom">fetch failed</failure></testcase></testsuite>')
+
+
+class _JobsGh:
+    def __init__(self, jobs, junit, error=None):
+        self._jobs, self._junit, self._error = jobs, junit, error
+
+    def jobs(self, repo, run_id, attempt=1):
+        return self._jobs
+
+    def artifact_member(self, repo, run_id, name, member, attempt=1):
+        if self._error:
+            raise self._error
+        return self._junit
+
+
+@pytest.mark.parametrize("name, conclusion, junit, error, want", [
+    ("release-verify", "failure", EXTERNAL_JUNIT, None, ["release-verify: binary:meshcom"]),
+    ("testlab", "failure", EXTERNAL_JUNIT, None, []),            # a job with no JUnit
+    ("release-verify", "cancelled", EXTERNAL_JUNIT, None, []),
+    ("release-verify", "failure", b"", None, []),                # the artifact is absent
+    ("release-verify", "failure", EXTERNAL_JUNIT, "GET … -> 410: expired", []),
+    ("release-verify", "failure", EXTERNAL_JUNIT, "bad zip", []),   # not a zip archive
+])
+def test_only_a_failed_job_whose_own_junit_is_all_external_is_external(name, conclusion, junit,
+                                                                      error, want):
+    import zipfile
+    from types import SimpleNamespace
+
+    from bot import cli
+    from bot.gh import GitHubError
+    raised = {None: None, "bad zip": zipfile.BadZipFile("File is not a zip file")}
+    gh = _JobsGh([{"name": name, "conclusion": conclusion}], junit,
+                 raised[error] if error in raised else GitHubError(error))
+    got = cli._external_jobs(SimpleNamespace(gh=gh), {"repo": "o/r", "id": 6}, {"run_attempt": 1})
+    assert got == want
+
+
+@pytest.mark.parametrize("verify, closed", [("failure", []), ("success", [3])])
+def test_a_degraded_gate_closes_only_when_its_job_succeeded(verify, closed):
+    """A red lane for any other reason (here a marked regression) says nothing about the outage."""
+    from bot import cli
+    green = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in cli.REQUIRED_CI]
+    lane = [{"name": "testlab", "conclusion": "failure", "head_sha": CAND},
+            {"name": "slow-build", "conclusion": "failure", "head_sha": CAND},
+            {"name": cli.LANE_JOB, "conclusion": verify, "head_sha": CAND}]
+
+    class _Gate(_ProveCtx):
+        closes = []
+
+        def open_issues(self, repo, label):
+            return ([{"number": 3, "title": "degraded gate: release-verify"}]
+                    if label == cli.DEGRADED else [])
+
+        def comment(self, repo, number, body):
+            pass
+
+        def update_issue(self, repo, number, **fields):
+            self.closes.append(number)
+
+    ctx = _Gate(jobs_by_run={5: green, 6: lane})
+    with pytest.raises(cli.Stop):
+        cli.stage_prove(ctx)
+    assert ctx.closes == closed
+
+
+def test_a_gate_report_that_cannot_read_its_jobs_never_stops_prove():
+    """The degraded-gate report is best-effort: an API error there must not replace the stop
+    the evidence earned (or stop a proven candidate)."""
+    from bot import cli
+    from bot.gh import GitHubError
+    green = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in cli.REQUIRED_CI]
+    lane = [{"name": "testlab", "conclusion": "success", "head_sha": CAND},
+            {"name": "slow-build", "conclusion": "success", "head_sha": CAND},
+            {"name": cli.LANE_JOB, "conclusion": "failure", "head_sha": CAND}]
+
+    class _Flaky(_ProveCtx):
+        reads = 0
+
+        def jobs(self, repo, run_id, attempt=1):
+            if int(run_id) == 6:
+                self.reads += 1
+                if self.reads == 2:                    # the gate report's own read
+                    raise GitHubError("GET /actions/runs/6/jobs -> 502")
+            return super().jobs(repo, run_id, attempt)
+
+    ctx = _Flaky(jobs_by_run={5: green, 6: lane})
+    with pytest.raises(cli.Stop) as stop:
+        cli.stage_prove(ctx)
+    assert "the candidate is not proven" in stop.value.observed
