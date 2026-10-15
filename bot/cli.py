@@ -64,7 +64,7 @@ BOT_URL = "https://github.com/" + BOT
 # Required jobs on the candidate commit. A skipped, neutral or missing one is NOT proof: the
 # release is authorised by an admin-bypass push, so nothing downstream re-checks these.
 REQUIRED_CI = ("test (3.11)", "test (3.12)", "test (3.13)", "pin-validation", "meshcore-host")
-REQUIRED_TESTLAB = ("testlab", "release-verify")
+REQUIRED_TESTLAB = ("testlab", "release-verify", "slow-build")
 
 BOUNDS = {"ci": 40 * 60, "binary": 190 * 60, "testlab": 280 * 60, "image": 330 * 60,
           "settle": 60 * 60}

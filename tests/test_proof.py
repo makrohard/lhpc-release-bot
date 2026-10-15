@@ -366,6 +366,7 @@ def _prove(*, ordinary="success"):
     from bot import cli
     green = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in cli.REQUIRED_CI]
     lane = [{"name": "testlab", "conclusion": ordinary, "head_sha": CAND},
+            {"name": "slow-build", "conclusion": "success", "head_sha": CAND},
             {"name": cli.LANE_JOB, "conclusion": "failure", "head_sha": CAND}]
     ctx = _ProveCtx(jobs_by_run={5: green, 6: lane})
     with pytest.raises(cli.Stop):
@@ -584,3 +585,13 @@ def test_unreadable_and_red_are_never_both_reported():
                            REQUIRED_CASES)):
         unreadable, red = _release_case_problems(xml, required)
         assert not (unreadable and red), f"both reported for {xml[:20]!r}"
+
+
+def test_a_testlab_run_without_its_slow_build_job_is_not_proof():
+    # The release requires the slow-target build proof (decision b): a testlab run whose
+    # slow-build job was skipped concludes success, and must still not count.
+    lane = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in REQUIRED_TESTLAB]
+    skipped = [dict(j, conclusion="skipped") if j["name"] == "slow-build" else j for j in lane]
+    identity, offlane, outcome = _run_problems(FakeCtx(skipped), att(), "testlab", rec(), run(),
+                                               REQUIRED_TESTLAB)
+    assert identity == ["slow-build: skipped"] and (offlane, outcome) == ([], [])
