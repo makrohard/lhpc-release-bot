@@ -247,3 +247,35 @@ def test_a_finish_dispatch_that_may_have_been_accepted_keeps_its_claim(said):
         cli.stage_plan(later)
     assert later.sent == []
 
+# ---- one unreachable upstream does not stop the others from moving ----
+
+class _Reached(Exception):
+    """Raised where the plan goes on to claim and build: it got past the fault gate."""
+
+
+def test_an_unreachable_source_beside_a_move_is_reported_and_the_plan_goes_on(tmp_path,
+                                                                              monkeypatch):
+    from bot import cli
+    from bot.upstream import examine
+    from tests.test_upstream import A, B, FakeRemote, _Unreadable, src
+    unreachable = _Unreadable("git -C x fetch -q --tags origin main: fatal: unable to access "
+                              "'https://h/': Could not resolve host: h")
+    found = [examine(src(A, path="src/a"), {"track": "tip"}, unreachable),
+             examine(src(A, path="src/b"), {"track": "tip"}, FakeRemote([A, B]))]
+    (tmp_path / "loraham-pi-control").mkdir()
+    (tmp_path / "loraham-pi-control" / cli.MANIFEST.split("/")[-1]).write_text("")
+    monkeypatch.setattr(cli, "MANIFEST", cli.MANIFEST.split("/")[-1])
+    monkeypatch.setattr(cli, "git", lambda *a, **k: "b" * 40)
+    monkeypatch.setattr(cli, "_findings", lambda ctx, text, policy: (found, None))
+    def note(ctx, kind, seen, examined):
+        ctx.degraded.append((kind, sorted(seen), sorted(examined)))
+    monkeypatch.setattr(cli, "_degraded", note, raising=False)       # absent before the change
+    monkeypatch.setattr(cli, "_check_parent", lambda ctx, frozen: (_ for _ in ()).throw(_Reached))
+    ctx = _PlanCtx(_owing(state="complete"))
+    ctx.degraded = []
+    ctx.clone = lambda repo, ref="", token="": tmp_path / "loraham-pi-control"
+    ctx.ref = lambda repo, ref: "d" * 40
+    with pytest.raises(_Reached):
+        cli.stage_plan(ctx)
+    assert any("Not reachable this run" in s and "`src/a`" in s for s in ctx.summaries)
+    assert ctx.degraded == [("source", ["src/a"], ["src/a", "src/b"])]

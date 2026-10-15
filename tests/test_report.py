@@ -71,6 +71,72 @@ def test_the_opening_names_the_event_that_started_the_run(monkeypatch, retry_of,
     assert word in ctx.bot_gh.created[0].splitlines()[0]
 
 
+# ---- a degraded state that persists is visible, never blocking ----
+
+class _Store:
+    def __init__(self):
+        self.issues, self.notes, self.n = {}, {}, 0
+
+    def open_issues(self, repo, label):
+        return [{"number": n, "title": i["title"], "body": i["body"]}
+                for n, i in self.issues.items() if i["state"] == "open"]
+
+    def create_issue(self, repo, title, body, labels):
+        self.n += 1
+        self.issues[self.n] = {"title": title, "state": "open", "body": body}
+        self.notes[self.n] = []
+        return {"number": self.n}
+
+    def comment(self, repo, number, body):
+        self.notes[number].append(body)
+
+    def comments(self, repo, number):
+        return [{"body": b} for b in self.notes[number]]
+
+    def update_issue(self, repo, number, **fields):
+        self.issues[number].update(fields)
+
+
+class _RunCtx:
+    def __init__(self, store, run_id):
+        self.bot_gh, self.run_id = store, run_id
+        self.run_url = f"https://example.invalid/run/{run_id}"
+
+
+def test_a_skipped_source_is_persistent_from_its_third_run_and_closes_when_seen_no_more():
+    store = _Store()
+    seen, examined = {"src/x": "not reachable this run, pin kept"}, {"src/x", "src/y"}
+    titles = []
+    for run in ("r1", "r2", "r2", "r3"):           # r2 twice: one run counts once
+        cli._degraded(_RunCtx(store, run), "source", seen, examined)
+        titles.append(store.issues[1]["title"])
+    assert [t.startswith("PERSISTENT ") for t in titles] == [False, False, False, True]
+    assert len(store.issues) == 1                      # one issue, not one per run
+    cli._degraded(_RunCtx(store, "r4"), "source", {}, set())     # never examined src/x
+    assert store.issues[1]["state"] == "open"
+    cli._degraded(_RunCtx(store, "r5"), "source", {}, examined)  # examined, and recovered
+    assert store.issues[1]["state"] == "closed"
+
+
+def test_a_persons_comment_is_not_an_occurrence():
+    store = _Store()
+    seen = {"src/x": "not reachable"}
+    cli._degraded(_RunCtx(store, "r1"), "source", seen, {"src/x"})
+    store.comment("o/r", 1, "I looked at this; the host is down for maintenance.")
+    store.comment("o/r", 1, "Still down.")
+    cli._degraded(_RunCtx(store, "r2"), "source", seen, {"src/x"})
+    assert not store.issues[1]["title"].startswith("PERSISTENT ")
+
+
+def test_a_re_run_of_the_opening_run_is_not_a_second_occurrence():
+    store = _Store()
+    titles = []
+    for run in ("r1", "r1", "r2", "r3"):           # GitHub re-runs keep the run id
+        cli._degraded(_RunCtx(store, run), "source", {"src/x": "not reachable"}, {"src/x"})
+        titles.append(store.issues[1]["title"].startswith("PERSISTENT "))
+    assert titles == [False, False, False, True]
+
+
 def test_an_expiring_incident_promises_renewal_only_on_an_attributable_regression():
     # The same rule as the README: an unmarked red writes no hold, so it renews nothing.
     from bot import report as rp

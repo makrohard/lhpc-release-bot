@@ -251,6 +251,52 @@ def blocking_attempts(open_attempts, retry_of: str) -> list:
             if a.unresolved and not (retry_of and a.run_id == retry_of)]
 
 
+DEGRADED = "degraded"
+PERSISTENT_AFTER = 3        # occurrences of the same degraded state before its issue says so
+
+
+def _degraded(ctx: Ctx, kind: str, seen: dict, examined) -> None:
+    """One informational issue per degraded state of this kind (a source skipped as unreachable,
+    a gate left unproven by an external outage): opened at the first occurrence, a comment per
+    run that sees it again, `PERSISTENT` in the title from the third occurrence, closed by the
+    first run that no longer sees it. It never holds, freezes or blocks anything.
+
+    Occurrences = the distinct run ids of the bot's own marks (`<!--degraded-run:<id>-->`) in the
+    body and the comments; a person's comment is not one, and a run counts once. An issue is closed only
+    for a key this run EXAMINED and did not find degraded — a run that never reached it proves
+    nothing. Best-effort: a report that cannot be written must not stop a release."""
+    prefix = f"degraded {kind}: "
+    mark = f"<!--degraded-run:{ctx.run_id}-->"
+    try:
+        issues = [i for i in ctx.bot_gh.open_issues(BOT, DEGRADED)
+                  if i.get("title", "").replace("PERSISTENT ", "", 1).startswith(prefix)]
+        by_key = {i["title"].replace("PERSISTENT ", "", 1)[len(prefix):]: i for i in issues}
+        for key, why in sorted(seen.items()):
+            issue = by_key.get(key)
+            if issue is None:
+                ctx.bot_gh.create_issue(BOT, prefix + key,
+                                        f"Seen in {ctx.run_url}: {why}\n\nInformational: it "
+                                        f"holds and blocks nothing, and closes itself when a run "
+                                        f"no longer sees it.\n{mark}", [DEGRADED])
+                continue
+            notes = [issue.get("body") or ""] + [
+                c.get("body", "") for c in ctx.bot_gh.comments(BOT, issue["number"])]
+            if not any(mark in n for n in notes):
+                ctx.bot_gh.comment(BOT, issue["number"], f"Seen again in {ctx.run_url}: {why}\n{mark}")
+                notes.append(mark)
+            # The opening run's mark is in the body, so a re-run of that run counts once too.
+            occurrences = len({m for n in notes
+                               for m in re.findall(r"<!--degraded-run:([^>]+)-->", n)})
+            if occurrences >= PERSISTENT_AFTER and not issue["title"].startswith("PERSISTENT "):
+                ctx.bot_gh.update_issue(BOT, issue["number"], title="PERSISTENT " + prefix + key)
+        for key, issue in by_key.items():
+            if key in examined and key not in seen:
+                ctx.bot_gh.comment(BOT, issue["number"], f"Cleared in {ctx.run_url}.")
+                ctx.bot_gh.update_issue(BOT, issue["number"], state="closed")
+    except GitHubError as exc:
+        print(f"the {kind} degraded issues could not be updated: {exc}", file=sys.stderr)
+
+
 FINISHABLE_OWES = {"dev integration", "the image"}
 REFUSED = re.compile(r"-> 4\d\d\b")     # GitHubError text for an HTTP 4xx answer (gh.py request)
 
@@ -368,6 +414,9 @@ def stage_plan(ctx: Ctx) -> int:
 
     ctx.summary(rp.summary(found, "No pin has moved" if not moved else
                            f"{len(moved)} pin(s) to move"))
+    if ctx.mode == "full":
+        _degraded(ctx, "source", {f.key: f.detail for f in found if f.status == "skipped"},
+                  examined={f.key for f in found})
     if ctx.mode == "watch-only":
         ctx.out(proceed="false")
         print("watch-only: reported, nothing else.")

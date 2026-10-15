@@ -121,6 +121,10 @@ the channel's typed message and offered the source build. Installed boxes are un
   run's failing jobs with the last lines of their logs). It lives here rather than in the controller so that a
   run whose release credential is the thing that failed can still report; this repository's own
   `GITHUB_TOKEN` writes it. Diagnostics are best-effort; the rest is never omitted.
+- **Something keeps not working, without failing:** one issue labelled `degraded` per state — a
+  source skipped as unreachable (`degraded source: <key>`) — opened at the first run that sees it,
+  commented by every later one, titled `PERSISTENT …` from the third, and closed by the first run
+  that no longer sees it. It holds, freezes and blocks nothing.
 
 ## Freeze a pin
 
