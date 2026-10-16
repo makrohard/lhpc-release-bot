@@ -1,4 +1,9 @@
-"""LHPC's own Python pins, checked in `prepare` before anything is pushed.
+"""LHPC's own Python pins, checked in `prepare` before anything is pushed (PLAN-bot-lockregen-NOTE).
+
+The lock check: `requirements.lock` on `main` must be what its pyproject resolves to on the
+interpreter the image runs. It is regenerated outside the checkout and compared by CONTENT — per
+requirement (name, version, environment marker, hashes) — so the file's own header and where
+pip-tools puts the build backend are layout, not a difference. The bot never writes the lock.
 
 The constraints check (finding 138): a component whose build installs against
 `{asset}/<name>-constraints.txt` breaks the whole run at prove when its upstream raises a dependency
@@ -9,6 +14,7 @@ constraints file: raising a floor is a reviewed commit on LHPC's `dev`.
 """
 from __future__ import annotations
 
+import difflib
 import re
 import subprocess
 import tempfile
@@ -89,6 +95,77 @@ def interpreter(python: str, runner=run, clock=None) -> tuple:
                           " not Python 3.13, the interpreter the image runs",
                           "Give the plan job a Python 3.13 (`actions/setup-python`).")
     return exe, version.split()[0]
+
+
+# ---- A: requirements.lock is what its pyproject resolves to -----------------------------------
+
+# pip-tools 7.4.1 crashes on pip 25.x ("'function' object has no attribute 'cache_clear'"), so
+# both are pinned. `--no-annotate`: no `# via` lines naming this run's temp path. `--build-deps-for
+# editable`: the build backend the lock carries for LHPC's `--no-build-isolation -e .`.
+# `--no-reuse-hashes`: pip-compile otherwise copies a kept pin's hashes from the output file it is
+# seeded with (the committed lock), so a stale or tampered hash set would compare equal (measured).
+LOCK_TOOLS = ("pip==24.2", "pip-tools==7.4.1")
+COMPILE = ("--generate-hashes", "--no-reuse-hashes", "--allow-unsafe", "--strip-extras", "--no-header",
+           "--no-annotate", "--no-emit-index-url", "--build-deps-for", "editable")
+LOCK_DIFF_MAX = 8000
+ENTRY = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*==\s*(?P<ver>[^\s;]+)"
+                   r"\s*(?:;\s*(?P<marker>.*))?$")
+
+
+def lock_entries(text: str) -> list:
+    """The content of a hashed requirements file, one normalized line per requirement, sorted:
+    `name==version ; marker | hash hash …`. Comments, blank lines, line continuations and order
+    are layout. A line that is not `name==version` is kept as it reads, so it still compares."""
+    joined = re.sub(r"\\\n", " ", text)
+    out = []
+    for raw in joined.splitlines():
+        line = " ".join(raw.split("#", 1)[0].split())
+        if not line:
+            continue
+        head, *hashes = line.split(" --hash=")
+        m = ENTRY.match(head.strip())
+        if not m:
+            out.append(f"unparsed: {line}")
+            continue
+        marker = " ".join((m["marker"] or "").replace("'", '"').split())
+        out.append(f"{canonical(m['name'])}=={m['ver']}" + (f" ; {marker}" if marker else "")
+                   + " | " + " ".join(sorted(h.strip() for h in hashes)))
+    return sorted(out)
+
+
+def lock_argvs(python: str, venv: Path, out: Path, pyproject: Path) -> list:
+    vpy = str(venv / "bin" / "python")
+    return [[python, "-m", "venv", str(venv)],
+            [vpy, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *LOCK_TOOLS],
+            [vpy, "-m", "piptools", "compile", *COMPILE, "--output-file", str(out), str(pyproject)]]
+
+
+def check_lock(lhpc: Path, runner=run, python=PYTHON, clock=None) -> str:
+    """A. Returns the summary line; raises CheckFailed on a difference or on any failure."""
+    lock = lhpc / "requirements.lock"
+    if not lock.is_file():
+        return "requirements.lock check: skipped, LHPC `main` has no requirements.lock yet."
+    clock = clock or Clock()
+    exe, version = interpreter(python, runner, clock)
+    remedy = ("On `dev`, run the command in the bot's `prepare` (bot/pins_check.py), commit the "
+              "lock, release it. Nothing was pushed.")
+    with tempfile.TemporaryDirectory(prefix="lhpc-lock-") as t:
+        out = Path(t) / "requirements.lock"
+        text = _read(lock, "LHPC `main`")
+        committed = lock_entries(text)
+        out.write_text(text)                    # pip-compile keeps the versions already there
+        for argv in lock_argvs(python, Path(t) / "venv", out, lhpc / "pyproject.toml"):
+            r = clock.call(runner, argv, cwd=t)
+            if r.returncode != 0:
+                raise CheckFailed("requirements.lock could not be regenerated", remedy,
+                                  fenced(r.stderr, LOCK_DIFF_MAX))
+        regenerated = lock_entries(_read(out, "the regenerated lock"))
+    if committed != regenerated:
+        diff = "\n".join(difflib.unified_diff(committed, regenerated, "requirements.lock (main)",
+                                              "requirements.lock (regenerated)", lineterm=""))
+        raise CheckFailed("requirements.lock on main is not what its pyproject resolves to",
+                          remedy, fenced(diff, LOCK_DIFF_MAX))
+    return f"requirements.lock is current (compiled with {exe}, Python {version})."
 
 
 # ---- B: a moved constraints-pinned checkout still fits its constraints file --------------------
