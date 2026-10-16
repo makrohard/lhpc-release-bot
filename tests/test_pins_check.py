@@ -353,22 +353,25 @@ def _plan_ctx(tmp: Path, monkeypatch):
     return lhpc, _PlanCtx(lhpc)
 
 
-def test_a_failed_check_stops_prepare_with_nothing_pushed_or_saved(tmp_path, monkeypatch):
+@pytest.mark.parametrize("which", ["check_lock", "check_constraints"])
+def test_a_failed_check_stops_prepare_with_nothing_pushed_or_saved(tmp_path, monkeypatch, which):
     from bot import cli
     lhpc, ctx = _plan_ctx(tmp_path, monkeypatch)
     seen = []
 
-    def failing(lhpc_, manifest_text, moved_, **kw):
-        seen.append([f.key for f in moved_])
+    def failing(lhpc_, *args, **kw):
+        seen.append(args)
         raise pc.CheckFailed("cli c… needs x>=2 but cli-constraints.txt pins x==1", "hold it",
                              "```\nERROR: ResolutionImpossible\n```")
-    monkeypatch.setattr(pc, "check_constraints", failing)
+    monkeypatch.setattr(pc, which, failing)
     with pytest.raises(cli.Stop) as stop:
         cli.stage_plan(ctx)
     assert stop.value.stage == "prepare" and "pins x==1" in stop.value.observed
     assert "ResolutionImpossible" in stop.value.detail
     assert any("ResolutionImpossible" in s for s in ctx.summaries)
-    assert seen == [["src/cli"]]                             # the EDITED manifest's moves
+    if which == "check_constraints":
+        assert [f.key for f in seen[0][1]] == ["src/cli"]    # the EDITED manifest's moves
+    assert len(seen) == 1
     assert ctx.saved == []                                    # no attempt
     branches = subprocess.run(["git", "branch", "--list", "pins/*"], cwd=lhpc,
                               capture_output=True, text=True, check=True).stdout
@@ -419,6 +422,7 @@ def test_a_hung_resolve_stops_the_check(tmp_path):
     assert "could not be resolved" in exc.value.observed and "timed out" in exc.value.detail
 
 
+
 def test_malformed_fetched_metadata_stops_prepare_not_the_catch_all(tmp_path, monkeypatch):
     # Every failure of a check is its own Stop at `prepare`, never main()'s "attempt left open".
     from bot import cli
@@ -434,3 +438,116 @@ def test_malformed_fetched_metadata_stops_prepare_not_the_catch_all(tmp_path, mo
         cli.stage_plan(ctx)
     assert stop.value.stage == "prepare" and "pyproject.toml is not valid TOML" in stop.value.observed
     assert ctx.saved == []
+
+# ---- A: requirements.lock compared by content ------------------------------------------------
+
+H1, H2, H3 = ("sha256:" + c * 64 for c in "123")
+LOCK = f"""# LHPC's runtime dependencies (a header the bot never writes)
+flask==3.1.3 \\
+    --hash={H1} \\
+    --hash={H2}
+setuptools==84.0.0 \\
+    --hash={H3}
+tomli==2.2.1 ; python_version < "3.11" \\
+    --hash={H1}
+"""
+# what pip-tools writes for the same content: no header, the build backend in its own section
+COMPILED = f"""flask==3.1.3 \\
+    --hash={H2} \\
+    --hash={H1}
+tomli==2.2.1 ; python_version < '3.11' \\
+    --hash={H1}
+
+# The following packages are considered to be unsafe in a requirements file:
+setuptools==84.0.0 \\
+    --hash={H3}
+"""
+
+
+class _Compile:
+    """The seam for A: the interpreter reports itself, and `piptools compile` writes `produce`
+    into its `--output-file` (an empty `produce` = the compile fails)."""
+
+    def __init__(self, produce: str, version="3.13.5 (main)"):
+        self.produce, self.version, self.calls = produce, version, []
+
+    def __call__(self, argv, cwd=None, timeout=900):
+        self.calls.append(list(argv))
+        if argv[:2] == [pc.PYTHON, "-c"]:
+            return subprocess.CompletedProcess(argv, 0, f"/usr/bin/python3.13\n{self.version}\n", "")
+        if "compile" in argv:
+            if not self.produce:
+                return subprocess.CompletedProcess(argv, 1, "", "pip._internal… no matching dist")
+            Path(argv[argv.index("--output-file") + 1]).write_text(self.produce)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def _with_lock(tmp: Path, text: str) -> Path:
+    lhpc = tmp / "lhpc"
+    lhpc.mkdir()
+    (lhpc / "requirements.lock").write_text(text)
+    (lhpc / "pyproject.toml").write_text('[project]\nname = "lhpc"\n')
+    return lhpc
+
+
+def test_header_order_and_quote_style_are_layout_not_content(tmp_path):
+    box = _Compile(COMPILED)
+    line = pc.check_lock(_with_lock(tmp_path, LOCK), runner=box)
+    assert line == "requirements.lock is current (compiled with /usr/bin/python3.13, Python 3.13.5)."
+
+
+@pytest.mark.parametrize("change", [
+    ("tomli==2.2.1 ; python_version < '3.11'", "tomli==2.2.1 ; python_version < '3.12'"),  # marker
+    ("flask==3.1.3", "flask==3.1.4"),                                                      # version
+    (f"--hash={H2}", f"--hash={H3}"),                                                       # hash
+], ids=["marker-only", "version", "hash"])
+def test_a_content_change_stops_with_the_normalized_diff(tmp_path, change):
+    lhpc = _with_lock(tmp_path, LOCK)
+    with pytest.raises(pc.CheckFailed) as exc:
+        pc.check_lock(lhpc, runner=_Compile(COMPILED.replace(*change)))
+    assert exc.value.observed == "requirements.lock on main is not what its pyproject resolves to"
+    assert "--- requirements.lock (main)" in exc.value.detail
+    assert "+++ requirements.lock (regenerated)" in exc.value.detail
+    assert (lhpc / "requirements.lock").read_text() == LOCK      # never written
+
+
+def test_the_compile_argv_runs_outside_the_checkout_on_3_13(tmp_path):
+    lhpc = _with_lock(tmp_path, LOCK)
+    box = _Compile(COMPILED)
+    pc.check_lock(lhpc, runner=box)
+    venv, install, compile_ = box.calls[1:]
+    assert venv[:3] == [pc.PYTHON, "-m", "venv"] and not venv[3].startswith(str(lhpc))
+    vpy = str(Path(venv[3]) / "bin" / "python")
+    assert install == [vpy, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
+                       "pip==24.2", "pip-tools==7.4.1"]
+    out = compile_[compile_.index("--output-file") + 1]
+    assert compile_ == [vpy, "-m", "piptools", "compile", "--generate-hashes",
+                        "--no-reuse-hashes", "--allow-unsafe",
+                        "--strip-extras", "--no-header", "--no-annotate", "--no-emit-index-url",
+                        "--build-deps-for", "editable", "--output-file", out,
+                        str(lhpc / "pyproject.toml")]
+    assert not out.startswith(str(lhpc))
+
+
+@pytest.mark.parametrize("what", ["interpreter-3.11", "compile-fails"])
+def test_a_lock_check_that_cannot_judge_stops(tmp_path, what):
+    box = _Compile("" if what == "compile-fails" else COMPILED,
+                   version="3.11.9 (main)" if what == "interpreter-3.11" else "3.13.5 (main)")
+    with pytest.raises(pc.CheckFailed):
+        pc.check_lock(_with_lock(tmp_path, LOCK), runner=box)
+    if what == "interpreter-3.11":
+        assert len(box.calls) == 1                 # nothing compiled on the wrong interpreter
+
+
+def test_a_lock_that_is_not_text_is_the_checks_own_failure(tmp_path):
+    lhpc = _with_lock(tmp_path, "")
+    (lhpc / "requirements.lock").write_bytes(b"\xff\xfe")
+    box = _Compile(COMPILED)
+    with pytest.raises(pc.CheckFailed, match="requirements.lock cannot be read"):
+        pc.check_lock(lhpc, runner=box)
+    assert not [c for c in box.calls if "compile" in c]
+
+
+def test_no_lock_on_main_yet_is_a_skip_with_a_line(tmp_path):
+    box = _Compile(COMPILED)
+    assert "skipped" in pc.check_lock(tmp_path, runner=box) and box.calls == []

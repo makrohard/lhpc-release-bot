@@ -8,7 +8,8 @@ Milestones only.
   `index-v3.json`. A web-client move republishes only an artifact that still records it; a dry
   run shows which.
 - The plan stops before pushing anything when a moved component raised a dependency floor its
-  LHPC constraints file does not allow, naming the requirement and the pin.
+  LHPC constraints file does not allow (naming the requirement and the pin), or when LHPC's
+  `requirements.lock` is not what its pyproject resolves to on Python 3.13.
 
 ## 0.1.0
 
