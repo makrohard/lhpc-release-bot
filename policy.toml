@@ -34,15 +34,12 @@ track = "tip"
 
 [source."src/meshcom-loraham-bridge"]
 track = "tip"
-freeze = "Automatic hold after binary build run 38337912496 for meshcom on c1ce162da; see https://github.com/makrohard/lhpc-release-bot/issues/62 \u2014 holds meshcom"
 
 [source."src/meshcom-qemu-raspi"]
 track = "tip"
-freeze = "Automatic hold after binary build run 38337912496 for meshcom on c1ce162da; see https://github.com/makrohard/lhpc-release-bot/issues/62 \u2014 holds meshcom"
 
 [source."src/MeshCom-Firmware"]
 track = "tip"
-freeze = "Automatic hold after binary build run 38337912496 for meshcom on c1ce162da; see https://github.com/makrohard/lhpc-release-bot/issues/62 \u2014 holds meshcom"
 why = "upstream develops on `dev`; its tags lag the branch by design"
 
 [source."src/openhop-core"]
