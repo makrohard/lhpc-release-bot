@@ -31,6 +31,22 @@ def test_a_record_survives_a_round_trip_through_an_issue_body():
     assert Attempt.from_body(a.to_body()) == a
 
 
+def test_a_record_written_before_the_history_index_reads_index_json():
+    """Records outlive runs: one written by the bot before it knew of index-v3.json has no
+    `binary_index`, and it published into index.json."""
+    import json
+    body = att(state="mutated", dispatched=["meshtastic"], index_snapshot={"stacks": {}}).to_body()
+    old = body.replace('"binary_index": "index.json",\n  ', "")
+    assert "binary_index" not in old and json.loads(old.split("<!--attempt\n")[1].split("\n-->")[0])
+    assert Attempt.from_body(old).binary_index == "index.json"
+
+
+def test_a_record_naming_an_index_the_bot_never_writes_is_unreadable():
+    with pytest.raises(Unreadable, match="binary_index"):
+        att(state="mutated", dispatched=["meshtastic"], index_snapshot={"stacks": {}},
+            binary_index="index.prev.json").validate()
+
+
 def test_a_body_with_no_record_is_absent_but_an_unreadable_one_raises():
     """The distinction the whole recovery rests on: nothing was written here, versus something
     was written and cannot be read. The second must never be treated as the first."""

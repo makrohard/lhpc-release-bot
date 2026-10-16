@@ -528,25 +528,15 @@ def stage_plan(ctx: Ctx) -> int:
 
     # ---- the edit -------------------------------------------------------------------------
     text = manifest_p.read_text()
-    for f in moved:
-        if f.key.startswith("extra."):
-            continue
-        text = mf.set_pin(text, f.key, f.candidate, f.tag)
     gw = next((f for f in moved if f.key == "extra.graywolf"), None)
     if gw:
         sums = _graywolf_sums(gw.candidate)
         script_p.write_text(mf.add_graywolf_checksums(script_p.read_text(), gw.candidate, sums))
         text = mf.set_graywolf_version(text, gw.current, gw.candidate)
-    web = next((f for f in moved if f.key == "extra.meshtastic-web"), None)
-    cli = next((f for f in moved if f.key == "extra.meshtastic-cli"), None)
     try:
-        if web:
-            # The digest is the release's own build.tar, which the fetch script re-checks on
-            # every install. Computed here from the artifact itself, never carried over.
-            text = mf.set_meshtastic_web(text, web.current, web.candidate,
-                                         _meshtastic_web_sha(web.candidate))
-        if cli:
-            text = mf.set_meshtastic_cli(text, cli.current, cli.candidate)
+        # The web digest is the release's own build.tar, which the fetch script re-checks on
+        # every install. Computed here from the artifact itself, never carried over.
+        text = edit_manifest(text, moved, _meshtastic_web_sha)
     except mf.Unreadable as exc:
         # Both moves also write the value LHPC records in the completion marker. A controller
         # that predates `build_inputs` has no such line, and editing only half of the pair would
@@ -573,6 +563,19 @@ def stage_plan(ctx: Ctx) -> int:
                    f"{check.stderr.strip()[:1000]}\n```",
                    "Nothing was pushed. Fix the edit rule in `bot/manifest.py`.")
 
+    # The binaries index this candidate's builds publish into is the one ITS manifest names.
+    try:
+        binary_index = mf.binary_index(manifest_p.read_text())
+    except mf.Unreadable as exc:
+        raise Stop("plan", f"the candidate's binary index: {exc}",
+                   "Nothing was pushed. Every [stack.binary] index_url must name the same "
+                   "index.json or index-v3.json of lhpc-binaries' `binaries` release.") from None
+    ctx.summary(f"binary index: `{binary_index}`")
+    # Decided BEFORE the dry-run exit, so a dry run shows which binaries the move republishes.
+    need = binary_rebuilds(mf.binary_stacks(manifest_p.read_text()),
+                           mf.recorded_inputs(manifest_p.read_text()), moved)
+    ctx.summary(f"binaries to rebuild: {', '.join(need) or 'none'}")
+
     if ctx.mode == "dry-run":
         ctx.summary("### Dry run — the diff that would be pushed\n\n```diff\n"
                     + git("diff", cwd=lhpc)[:8000] + "\n```")
@@ -588,6 +591,7 @@ def stage_plan(ctx: Ctx) -> int:
                   candidate_sha=candidate, branch=branch, dev_sha=dev_sha,
                   moved_keys=[f.key for f in moved], retry_of=ctx.retry_of,
                   base_ref=base_ref(), inputs=[asdict(f) for f in moved],
+                  binary_index=binary_index,
                   notes=[f"moves: {', '.join(f.key for f in moved)}"])
     # The record exists BEFORE the branch is pushed. A push whose reply is lost still happened,
     # and a branch no attempt names is a mutation nothing would ever clean up.
@@ -596,7 +600,6 @@ def stage_plan(ctx: Ctx) -> int:
     att.runs["ci"] = ctx.record_run(LHPC, ctx.gh.dispatch(LHPC, CI_WORKFLOW, branch))
     ctx.save_attempt(number, att)
 
-    need = binary_rebuilds(mf.binary_stacks(manifest_p.read_text()), moved)
     refusal = rehearsal_publish_refusal(att, need)
     if refusal:
         raise Stop("plan", refusal,
@@ -931,7 +934,7 @@ def stage_build(ctx: Ctx) -> int:
                    "A rehearsal never publishes a binary. Nothing was dispatched.")
 
     if not att.index_snapshot:
-        att.index_snapshot = _live_index(ctx)
+        att.index_snapshot = _live_index(ctx, att.binary_index)
     # Recorded BEFORE the dispatch: a dispatch whose reply is lost has still started a writer,
     # and recovery must know a publish may exist for this stack.
     if stack not in att.dispatched:
@@ -978,8 +981,9 @@ def stage_build(ctx: Ctx) -> int:
                    f"attempt can claim.",
                    "Nothing was released. Inspect the publish job before re-running.",
                    detail=run.get("html_url", ""))
-    live = _live_index(ctx).get("stacks", {}).get(stack)
-    if _canon(live) != _canon(entry):
+    live = _live_index(ctx, att.binary_index).get("stacks", {})
+    if not (published_first(live, stack, entry) if att.binary_index == "index-v3.json"
+            else _canon(live.get(stack)) == _canon(entry)):
         raise Stop("build", f"the {stack} entry this build produced is not the live one — "
                    f"somebody published in between.",
                    "Nothing was released. Recovery will report the conflict rather than "
@@ -988,38 +992,42 @@ def stage_build(ctx: Ctx) -> int:
     return 0
 
 
-# The two pins that are not commits and ARE recorded in the Meshtastic completion marker, which
-# ships inside the published artifact. Moving either one obliges a republish.
-_MESHTASTIC = "meshtastic"
-_MARKER_RECORDED = ("extra.meshtastic-web", "extra.meshtastic-cli")
+def edit_manifest(text: str, moved, web_digest) -> str:
+    """The candidate's manifest text: every moved commit pin, then the web client and the CLI
+    (`web_digest(version)` = the sha256 of that release's `build.tar`). Graywolf is moved by the
+    caller, which also edits its fetch script. Raises `mf.Unreadable` when the manifest cannot
+    carry a move."""
+    for f in moved:
+        if not f.key.startswith("extra."):
+            text = mf.set_pin(text, f.key, f.candidate, f.tag)
+    web = next((f for f in moved if f.key == "extra.meshtastic-web"), None)
+    cli = next((f for f in moved if f.key == "extra.meshtastic-cli"), None)
+    if web:
+        text = mf.set_meshtastic_web(text, web.current, web.candidate, web_digest(web.candidate))
+    if cli:
+        text = mf.set_meshtastic_cli(text, cli.current, cli.candidate)
+    return text
 
 
-def binary_rebuilds(binary_stacks: dict, moved) -> list:
+def binary_rebuilds(binary_stacks: dict, recorded: dict, moved) -> list:
     """Which published binaries this candidate makes stale.
 
     A moved component pin makes stale every artifact that COVERS it — that is the pins-must-match
-    gate's own rule. The Meshtastic web client is the exception that rule cannot see: it is not a
-    component pin, so no `covers` set names it, yet it is unpacked into
-    `build/tools/meshtasticd/web`, which is a publish root. Left out, the index would go on
-    serving an artifact carrying the OLD client while the manifest claimed the new one, and
-    nothing would notice — the gate compares component commits, and none of them moved.
-
-    The CLI venv is likewise built on the box and is not in the artifact — but the VALUE is.
-    LHPC records both versions in the completion marker, and the artifact ships that marker, so
-    an un-republished binary reads "not built" on every box and the reinstall hands back the same
-    stale marker. Both moves therefore force the republish.
+    gate's own rule. A moved pin that is not a commit (`extra.<name>`: the Meshtastic web client,
+    the CLI) is invisible to that rule, yet LHPC records its value as a build input in the
+    completion marker, and the artifact ships that marker: an un-republished binary then reads
+    "not built" on every box, and the reinstall hands back the same stale marker. So such a move
+    republishes every binary stack whose covered components RECORD it (`recorded`, read from the
+    candidate's manifest). The rule follows the manifest: a renamed stack is still the one
+    rebuilt, and a value no artifact records any more (the web client as its own component)
+    republishes nothing.
     """
     moved_components = {c for f in moved for c in f.consumers}
     need = {s for s, covers in binary_stacks.items() if moved_components.intersection(covers)}
-    if any(f.key in _MARKER_RECORDED for f in moved):
-        # Named, not hard-coded: a renamed stack must fail loudly here rather than quietly stop
-        # forcing the republish that keeps every binary box installable.
-        if _MESHTASTIC not in binary_stacks:
-            raise Stop("plan", f"the manifest has no {_MESHTASTIC!r} binary stack, but a pin "
-                               f"recorded in its build marker moved.",
-                       "The stack was renamed or dropped. Update the rebuild rule in the bot "
-                       "before releasing, or the published artifact goes stale silently.")
-        need.add(_MESHTASTIC)
+    for f in moved:
+        if f.key.startswith("extra."):
+            name = f.key.split(".", 1)[1]
+            need |= {s for s, names in recorded.items() if name in names}
     return sorted(need)
 
 
@@ -1059,6 +1067,61 @@ def reconcile(dispatched, ours: dict, live: dict, snapshot: dict) -> tuple:
         else:
             conflicts.append(stack)
     return restore, noop, conflicts
+
+
+def composition(e: dict) -> tuple:
+    """What a box compares before it downloads (index-v3.json): an entry of the same composition
+    REPLACES the older one in the history; any other composition is kept beside it."""
+    return (e.get("target"), e.get("channel"), sorted((e.get("components") or {}).items()),
+            sorted((e.get("inputs") or {}).items()))
+
+
+def _same_build(a: dict, b: dict) -> bool:
+    """The same published artifact, compared on everything the fragment states. `inputs` and
+    `published_at` are the publisher's own fields in index-v3.json; the fragment has neither."""
+    def core(e):
+        return {k: v for k, v in e.items() if k not in ("inputs", "published_at")}
+    return _canon(core(a)) == _canon(core(b))
+
+
+def _ours_in(history: list, mine: dict):
+    """This attempt's entry in a stack's index-v3 history (by filename and digest), or None."""
+    for e in history or []:
+        if e.get("filename") == mine.get("filename") and e.get("sha256") == mine.get("sha256"):
+            return e
+    return None
+
+
+def published_first(stacks: dict, stack: str, entry: dict) -> bool:
+    """index-v3.json: this build's entry is the NEWEST of its stack, and it is this build's (the
+    whole fragment-stated entry, not a few fields)."""
+    history = stacks.get(stack) or []
+    return bool(history) and _ours_in(history[:1], entry) is not None \
+        and _same_build(history[0], entry)
+
+
+def reconcile_v3(dispatched, ours: dict, live: dict, snapshot: dict) -> tuple:
+    """index-v3.json, per stack a publish was started for: (no-op, conflict). There is no restore:
+    the history keeps every other composition, and B1 has no v3 rollback.
+
+      no-op     nothing reached the index (live is the snapshot), or our entry is a NEW
+                composition: only a controller with exactly these pins and inputs selects it
+      conflict  our rebuild REPLACED a composition the snapshot already had (an older
+                controller's proven entry is gone), or the outcome is unknown or foreign
+    """
+    noop, conflicts = [], []
+    for stack in dispatched:
+        mine, history = ours.get(stack), live.get(stack) or []
+        before = snapshot.get(stack) or []
+        found = _ours_in(history, mine) if mine else None
+        if found is None:
+            (noop if _canon(history) == _canon(before) else conflicts).append(stack)
+        elif _same_build(found, mine) and not any(composition(e) == composition(found)
+                                                    for e in before):
+            noop.append(stack)
+        else:
+            conflicts.append(stack)
+    return noop, conflicts
 
 
 ARTIFACT_NAME = re.compile(r"(?P<stack>[a-z0-9-]+)-(?P<sha>[0-9a-f]{64})\.tar\.zst\Z")
@@ -1163,14 +1226,15 @@ def _candidate_entry(ctx: Ctx, rec: dict, stack: str, candidate_sha: str):
         stack, candidate_sha)
 
 
-def _live_index(ctx: Ctx) -> dict:
-    """The published index, read through the AUTHENTICATED API.
+def _live_index(ctx: Ctx, name: str) -> dict:
+    """The published index this attempt publishes into (`index.json` or `index-v3.json`, as the
+    candidate's manifest names it), read through the AUTHENTICATED API.
 
     Not the public download URL: that is served by a CDN which can return the previous bytes
     for a while after a pointer switch, and a rollback decided on stale bytes is a decision
     about the past.
     """
-    return json.loads(ctx.gh.release_asset(BIN, "binaries", "index.json"))
+    return json.loads(ctx.gh.release_asset(BIN, "binaries", name))
 
 
 # ---------------------------------------------------------------------------- stage: prove
@@ -2012,7 +2076,7 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
                    "`recover` once it is terminal.")
 
     # ---- reconcile every stack a publish was STARTED for --------------------------------
-    live = _live_index(ctx).get("stacks", {})
+    live = _live_index(ctx, att.binary_index).get("stacks", {})
     snapshot = (att.index_snapshot or {}).get("stacks", {})
     for stack in att.dispatched:
         if stack not in att.published:
@@ -2027,16 +2091,25 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
                 att.published[stack] = entry
                 ctx.save_attempt(number, att)
     ours = dict(att.published)
-    restore, noop, conflicts = reconcile(att.dispatched, ours, live, snapshot)
+    if att.binary_index == "index-v3.json":
+        # A history, not a pointer: nothing is restored (there is no v3 rollback). An entry of a
+        # NEW composition stays where it is; only a replaced one is a conflict.
+        restore = []
+        noop, conflicts = reconcile_v3(att.dispatched, ours, live, snapshot)
+        why = ("this attempt's rebuild replaced a composition the index already served, or the "
+               "outcome of this attempt's own build is unknown")
+    else:
+        restore, noop, conflicts = reconcile(att.dispatched, ours, live, snapshot)
+        why = ("somebody published in between, or the outcome of this attempt's own build is "
+               "unknown")
 
     if conflicts:
-        att.notes.append("recovery stopped: the live entry for "
-                         + ", ".join(conflicts) + " is neither this attempt's nor the snapshot")
+        att.notes.append(f"recovery stopped ({att.binary_index}): the live entry for "
+                         + ", ".join(conflicts) + " is not one this attempt may leave or restore")
         ctx.save_attempt(number, att)
-        raise Stop("recover", "the binary index holds an entry this attempt cannot claim:\n\n"
-                   + "\n".join(f"- {c}" for c in conflicts),
-                   "Nothing was changed. Somebody published in between, or the outcome of this "
-                   "attempt's own build is unknown. The attempt stays open for inspection.")
+        raise Stop("recover", f"the binary index ({att.binary_index}) holds an entry this "
+                   f"attempt cannot claim:\n\n" + "\n".join(f"- {c}" for c in conflicts),
+                   f"Nothing was changed: {why}. The attempt stays open for inspection.")
 
     if restore:
         stacks = ",".join(sorted(restore))
@@ -2059,7 +2132,7 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
             raise Stop("recover", "the binary index could not be restored.",
                        "This attempt stays open and blocks new releases. Inspect the rollback "
                        "run, then re-run `recover`.", detail=run.get("html_url", ""))
-        back = _live_index(ctx).get("stacks", {})
+        back = _live_index(ctx, att.binary_index).get("stacks", {})
         wrong = [s for s in restore if _canon(back.get(s)) != _canon(snapshot.get(s))]
         if wrong:
             att.notes.append("rollback reported success but the index still differs for "
@@ -2070,7 +2143,9 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
                        "This attempt stays open. Inspect the rolling release by hand.")
         att.notes.append(f"index restored for {stacks}")
     if noop:
-        att.notes.append(f"already at the snapshot: {', '.join(sorted(noop))}")
+        att.notes.append(("left in the history (a new composition, or nothing published): "
+                          if att.binary_index == "index-v3.json" else "already at the snapshot: ")
+                         + ", ".join(sorted(noop)))
 
     if att.branch:
         lhpc = ctx.clone(LHPC, "main")

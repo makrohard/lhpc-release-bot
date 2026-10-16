@@ -96,6 +96,9 @@ class Attempt:
     # The ONE automatic `finish` for a released attempt that owes only integration and the image:
     # "" none; "dispatching:<run id>" claimed by that run, before sending; else the finish run id.
     finish_run: str = ""
+    # The binaries index this attempt's builds publish into, as the candidate's manifest names
+    # it. A record written before index-v3.json existed has none: it published into index.json.
+    binary_index: str = "index.json"
 
     @property
     def rehearsal(self) -> bool:
@@ -142,6 +145,9 @@ class Attempt:
             value = getattr(self, name)
             if value and not SHA.match(value):
                 raise Unreadable(f"attempt {self.run_id or '?'}: {name} is not a commit sha")
+        if self.binary_index not in ("index.json", "index-v3.json"):
+            raise Unreadable(f"attempt {self.run_id or '?'}: binary_index {self.binary_index!r} "
+                             f"is no index this bot publishes into")
         if not isinstance(self.published, dict) or not isinstance(self.dispatched, list):
             raise Unreadable(f"attempt {self.run_id or '?'}: malformed publish record")
 

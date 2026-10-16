@@ -98,7 +98,8 @@ def test_a_held_input_drives_no_binary_rebuild():
     held = Finding(key="extra.meshtastic-web", track="release", status="frozen",
                    current="2.7.2", candidate="2.7.3")
     assert not held.moves
-    assert binary_rebuilds({"meshtastic": ("meshtastic",)}, [f for f in [held] if f.moves]) == []
+    assert binary_rebuilds({"meshtastic": ("meshtastic",)}, {"meshtastic": ("meshtastic-web",)},
+                           [f for f in [held] if f.moves]) == []
 
 
 def test_only_the_unfrozen_input_of_a_mixed_run_is_eligible():

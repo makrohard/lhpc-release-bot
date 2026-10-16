@@ -63,12 +63,14 @@ So a green lane is real evidence for the last three and evidence against a fake 
 
 **Two pins that are not git sources are moved.** The Meshtastic browser client is named in the
 manifest by release version and by the sha256 of that release's `build.tar`; the bot fetches the
-archive, hashes it, moves both, and — because the client ships INSIDE the Meshtastic artifact —
-forces that binary to be republished. The Meshtastic CLI is a pip version in a build step, and its
-venv is built on the box, so the box installs the new CLI itself. What the artifact carries is
-the web client's BYTES and, beside the built binary, a record of both versions — and that record
-is why moving either one forces the republish. Both also move the matching
-`build_inputs` entry, which is what makes an already-built box notice the bump at all. Graywolf is
+archive, hashes it and moves both. The Meshtastic CLI is a pip version in a build step, and its
+venv is built on the box, so the box installs the new CLI itself. LHPC records both versions as
+build inputs in the completion marker that the Meshtastic artifact ships, so moving either one
+republishes every binary stack whose covered components record that input (read from the
+candidate's manifest: today Meshtastic; once the web client is its own component, a web move
+republishes nothing). Where the manifest records them, both also move the matching
+`build_inputs` entry, which is what makes an already-built box notice the bump at all; the web
+client as its own component records none, so its fetch step is the whole pin. Graywolf is
 the third: its release version plus the three checksum rows the fetch script verifies.
 
 A non-git pin moves forward only, like a git one. There is no history to walk, so the versions
@@ -92,7 +94,7 @@ proved.
 
 A run the bot waits on (controller CI, test lab, binary build, image build) whose first attempt is red only because a job lost its runner has its failed jobs re-run once, within the same time bound, and the second attempt is the one judged. Runner loss is what GitHub itself annotates on the job — "The runner has received a shutdown signal", "lost communication with the server" or "was not acquired by Runner" — and every other failed job must `needs` a lost one, directly or through other jobs (read from the run's own workflow file at its commit), and have started after it ended. The attempt issue notes the re-run. Any other red, a workflow file that cannot be read, too little time left, and a runner lost on any later attempt are judged as they are. In the test lab's `release-verify` and `slow-build` jobs (the two that write a JUnit), a job whose every failure carries the lanes' typed line `EXTERNAL-UNAVAILABLE what=<token>` — and no `STACK-REGRESSION` — failed on an external transfer, not on the candidate: its failed jobs are re-run after waits of 0, 1, 2, 5 and 10 minutes, at most five re-runs of either kind in one wait (six attempts), each only while the time left covers its wait plus the last attempt's duration. If the transfer is still unavailable after that, the release stops as `unproven, external`: nothing is attributed or held, the next scheduled run tries again, and a `degraded gate: <job>` issue tracks it. A red `testlab` job, CI, or a transfer that failed before the JUnit was written is judged as an ordinary red (the lanes retry their own downloads first). Evidence read from the re-run's artifacts is the second attempt's own upload, or one from a carried-over job that finished before any failed job started; anything else reads as absent.
 
-When a stage before the commit point fails, recovery restores the index and deletes the candidate branch. If the failure named the stack that broke, it also holds that stack and retries once — see [Freeze a pin](#freeze-a-pin).
+When a stage before the commit point fails, recovery restores the index and deletes the candidate branch. The index is the one the candidate's manifest names (`index.json`, or `index-v3.json`, the per-stack history newer controllers read); in `index-v3.json` nothing is restored: an entry of a new composition stays (only a controller with exactly those pins selects it), and a rebuild that replaced a composition already in the index stops recovery as a conflict. If the failure named the stack that broke, it also holds that stack and retries once — see [Freeze a pin](#freeze-a-pin).
 
 The order is forced by the proof: the aarch64 test lab installs MeshCom and Meshtastic from the
 published index, so the candidate binaries have to be live before the lane can run. Between that
@@ -219,7 +221,7 @@ Actions → **release** → Run workflow:
 |---|---|
 | `full` | the whole thing (this is what the schedule runs) |
 | `watch-only` | reports what has moved and stops — the check to run before a minor release |
-| `dry-run` | makes the edit locally, prints the diff, pushes nothing |
+| `dry-run` | makes the edit locally, prints the diff and the binaries it would republish, pushes nothing |
 | `finish` | finishes whatever an attempt whose controller release already happened still owes — its `dev` integration, its image, or both |
 | `recover` | undoes an attempt that stopped before the commit point |
 

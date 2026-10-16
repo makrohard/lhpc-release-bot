@@ -223,6 +223,40 @@ class Unreadable(ValueError):
     """
 
 
+# The binaries index a candidate publishes into: the asset its manifest's `[stack.binary]
+# index_url` names in lhpc-binaries' rolling release. The builder writes the one the recipe names,
+# so the bot reads and checks the same one.
+BINARY_RELEASE = "https://github.com/makrohard/lhpc-binaries/releases/download/binaries/"
+INDEX_NAMES = ("index.json", "index-v3.json")
+
+
+def binary_index(manifest_text: str) -> str:
+    """`index.json` or `index-v3.json`: the one index every binary stack of this manifest names."""
+    doc = tomllib.loads(manifest_text)
+    urls = sorted({st["binary"].get("index_url", "") for st in doc.get("stack", [])
+                   if st.get("binary")})
+    names = {u[len(BINARY_RELEASE):] if u.startswith(BINARY_RELEASE) else "" for u in urls}
+    if len(names) != 1 or next(iter(names)) not in INDEX_NAMES:
+        raise Unreadable(f"the binary stacks do not name one index this bot publishes into "
+                         f"({', '.join(urls) or 'none'})")
+    return names.pop()
+
+
+def recorded_inputs(manifest_text: str) -> dict:
+    """{binary stack id: (build_input names its covered components record)} — the values LHPC
+    writes into the completion marker, which the published artifact ships. Moving one of them
+    makes that artifact stale even though no covered commit moved."""
+    doc = tomllib.loads(manifest_text)
+    out = {}
+    for st in doc.get("stack", []):
+        if not st.get("binary"):
+            continue
+        covers = set(st["binary"].get("covers", []))
+        out[st["id"]] = tuple(bi["name"] for c in st.get("component", [])
+                              if c.get("id") in covers for bi in c.get("build_inputs", []))
+    return out
+
+
 def meshtastic_web(manifest_text: str) -> tuple:
     """(version, sha256) of the pinned web client."""
     m = WEB_LINE.search(manifest_text)
@@ -286,7 +320,26 @@ def set_meshtastic_web(manifest_text: str, old: str, new: str, sha256: str) -> s
     text, a = re.subn(rf"web client v{re.escape(old)}\b", f"web client v{new}", text, count=1)
     if a != 1:
         raise ValueError(f"meshtastic web: the announcement does not name v{old}")
+    if _build_input("meshtastic-web").search(text) is None and \
+            web_fetch_component(text) == "meshtastic-web":
+        # The client as its own component: its marker is static and records nothing, so the fetch
+        # step IS the whole pin. Where the fetch is meshtasticd's step, its recorded input moves
+        # with it, and a manifest that records none predates the recorded inputs (Unreadable).
+        return text
     return set_build_input(text, "meshtastic-web", old, new)
+
+
+def web_fetch_component(manifest_text: str) -> str:
+    """The id of the one component whose build step runs the web-client fetch script ('' if not
+    exactly one, or not a whole manifest)."""
+    try:
+        doc = tomllib.loads(manifest_text)
+    except tomllib.TOMLDecodeError:
+        return ""
+    ids = {c.get("id", "") for st in doc.get("stack", []) for c in st.get("component", [])
+           for step in c.get("build_steps", [])
+           if any(str(a).endswith("/meshtastic-web-assets.sh") for a in step.get("argv", []))}
+    return ids.pop() if len(ids) == 1 else ""
 
 
 def set_meshtastic_cli(manifest_text: str, old: str, new: str) -> str:

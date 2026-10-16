@@ -280,3 +280,56 @@ def test_a_recorded_input_keeps_the_token_that_binds_it():
     out = set_meshtastic_cli(out, "2.7.11", "2.8.1")
     assert ('{ name = "meshtastic-cli", value = "2.8.1", '
             'command = "pip", token = "meshtastic=={value}" }') in out
+
+
+# ---- the web client as its own component (the controller's Track F layout) ----
+
+C3 = (__import__("pathlib").Path(__file__).with_name("manifest_c3_meshtastic.toml")).read_text()
+
+
+def _web_move(old="2.7.2", new="2.8.0"):
+    from bot.upstream import Finding
+    return Finding(key="extra.meshtastic-web", track="release", status="move", current=old,
+                   candidate=new, consumers=())
+
+
+def test_a_web_move_on_the_own_component_layout_edits_the_fetch_step_and_rebuilds_nothing():
+    """The plan's own edit and rebuild decision on the controller's layout: the client is its
+    own component, meshtasticd records no web input any more, so the move edits only the fetch
+    step (version, digest, announcement) and republishes no binary."""
+    from bot import cli
+    from bot.manifest import binary_stacks, meshtastic_web, recorded_inputs
+    moved = [_web_move()]
+    out = cli.edit_manifest(C3, moved, lambda version: "a" * 64)
+    assert meshtastic_web(out) == ("2.8.0", "a" * 64)
+    changed = [b for a, b in zip(C3.splitlines(), out.splitlines(), strict=True) if a != b]
+    assert len(changed) == 1 and "web client v2.8.0" in changed[0]
+    assert cli.binary_rebuilds(binary_stacks(out), recorded_inputs(out), moved) == []
+
+
+def test_a_web_fetch_in_meshtasticd_without_its_recorded_input_is_still_refused():
+    """The older layout: the fetch is meshtasticd's own step, whose marker must record the
+    version. A manifest without that record predates the recorded inputs and cannot carry the
+    move."""
+    import pytest
+
+    from bot.manifest import Unreadable, set_meshtastic_web
+    legacy = ('[[stack]]\nid = "meshtastic"\n  [[stack.component]]\n  id = "meshtastic"\n'
+              + MESHTASTIC.replace(
+                  '    { name = "meshtastic-web", value = "2.7.2", command = "meshtastic-web-assets.sh", token = "{value}" },\n',
+                  ""))
+    assert 'name = "meshtastic-web"' not in legacy
+    with pytest.raises(Unreadable, match="records no build_input"):
+        set_meshtastic_web(legacy, "2.7.2", "2.8.0", "a" * 64)
+
+
+def test_the_dry_run_reports_the_rebuild_decision():
+    """A dry run is the check before a release: it must show which binaries the move republishes,
+    so the decision is made before the dry run returns."""
+    import inspect
+
+    from bot import cli
+    src = inspect.getsource(cli.stage_plan)
+    decided = src.index("need = binary_rebuilds(")
+    reported = src.index('ctx.summary(f"binaries to rebuild:')
+    assert decided < reported < src.index('if ctx.mode == "dry-run":')
