@@ -1,0 +1,38 @@
+# Verbatim lines of loraham-pi-control 283be9be lhpc/data/manifest.example.toml (the web client as its
+# own component, Track F C3): the meshtastic stack's binary block, the meshtastic component's CLI
+# step, recorded inputs and source, and the meshtastic-web component. Every other line is elided.
+[[stack]]
+id = "meshtastic"
+  [stack.binary]
+  index_url = "https://github.com/makrohard/lhpc-binaries/releases/download/binaries/index-v3.json"
+  covers = ["meshtastic"]
+  [[stack.component]]
+  id = "meshtastic"
+  build_steps = [
+    { argv = ["{runtime}/build/tools/meshtastic-cli/.venv/bin/pip", "install", "--disable-pip-version-check", "meshtastic==2.7.11", "pycryptodomex==3.23.0"], announce = "[install] Meshtastic CLI 2.7.11 + pycryptodomex 3.23.0 into {runtime}/build/tools/meshtastic-cli/.venv — pip is quiet off-TTY and pulls protobuf/pyserial/bleak; progress: watch {runtime}/build/tools/meshtastic-cli/.venv/lib grow" },
+  ]
+  build_inputs = [
+    { name = "meshtastic-cli", value = "2.7.11", command = "pip", token = "meshtastic=={value}" },
+    { name = "meshtastic-decoder-crypto", value = "3.23.0", command = "pip", token = "pycryptodomex=={value}" },
+  ]
+    [stack.component.source]
+    path = "src/meshtastic-firmware"
+    pin_commit = "54e0d8d0ab2ff56b3a9ce967e53f79e49af560fb"
+    pin_tag = "v2.7.26.54e0d8d"
+    remote = "https://github.com/meshtastic/firmware.git"
+    branch = "master"
+    local_dir = "meshtastic-firmware"
+  [[stack.component]]
+  id = "meshtastic-web"
+  name = "Meshtastic web client"
+  kind = "library"
+  purpose = "The browser UI meshtasticd serves: Known working (binary), Latest stable or Development."
+  # `optional` = not runnable, not started with the stack (like RadioLib); the stack's build
+  # fetches it, and meshtastic's binary install installs it in the same run.
+  optional = true
+  build_steps = [
+    { argv = ["bash", "{asset}/scripts/meshtastic-web-assets.sh", "{runtime}/build/tools/meshtastic-web/web", "2.7.2", "62657b85b4c24af4d44da2932b64143abdbf6e65a79fcb51fd0801d9540616e2"], announce = "[fetch] Meshtastic web client v2.7.2 (LHPC pin, sha256-verified) into {runtime}/build/tools/meshtastic-web/web" },
+  ]
+  bin = "build/tools/meshtastic-web/web"
+  build_marker = "build/tools/meshtastic-web/.lhpc-built"
+  build_root = "build/tools/meshtastic-web"

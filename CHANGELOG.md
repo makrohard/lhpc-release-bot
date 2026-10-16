@@ -2,6 +2,12 @@
 
 Milestones only.
 
+## Unreleased
+
+- Binaries go into the index the candidate's manifest names: `index.json`, or the history
+  `index-v3.json`. A web-client move republishes only an artifact that still records it; a dry
+  run shows which.
+
 ## 0.1.0
 
 - First version. Weekly (and on demand) it moves the pins its policy allows, republishes the

@@ -127,17 +127,21 @@ def finding(key, consumers=()):
 
 COVERS = {"daemon": ("loraham-daemon", "radiolib"), "meshtastic": ("meshtastic",),
           "meshcom": ("meshcom-qemu", "meshcom-bridge", "meshcom-firmware")}
+# The build inputs each binary stack's covered components record (the completion marker the
+# artifact ships), as the manifest declares them today.
+RECORDED = {"daemon": (), "meshcom": (),
+            "meshtastic": ("meshtastic-web", "meshtastic-cli", "meshtastic-decoder-crypto")}
 
 
 def test_a_moved_component_pin_rebuilds_the_artifact_that_covers_it():
     from bot.cli import binary_rebuilds
-    assert binary_rebuilds(COVERS, [finding("src/meshcom-qemu-raspi", ["meshcom-qemu"])]) \
-        == ["meshcom"]
+    moved = [finding("src/meshcom-qemu-raspi", ["meshcom-qemu"])]
+    assert binary_rebuilds(COVERS, RECORDED, moved) == ["meshcom"]
 
 
 def test_a_pin_no_artifact_covers_rebuilds_nothing():
     from bot.cli import binary_rebuilds
-    assert binary_rebuilds(COVERS, [finding("src/openhop-core", ["meshcore-node"])]) == []
+    assert binary_rebuilds(COVERS, RECORDED, [finding("src/openhop-core", ["meshcore-node"])]) == []
 
 
 def test_moving_the_web_client_rebuilds_the_meshtastic_artifact():
@@ -146,7 +150,7 @@ def test_moving_the_web_client_rebuilds_the_meshtastic_artifact():
     claimed the new one, and the pins-must-match gate would not notice: it compares component
     commits, and none moved."""
     from bot.cli import binary_rebuilds
-    assert binary_rebuilds(COVERS, [finding("extra.meshtastic-web")]) == ["meshtastic"]
+    assert binary_rebuilds(COVERS, RECORDED, [finding("extra.meshtastic-web")]) == ["meshtastic"]
 
 
 def test_moving_the_cli_also_rebuilds_the_meshtastic_artifact():
@@ -154,24 +158,163 @@ def test_moving_the_cli_also_rebuilds_the_meshtastic_artifact():
     the artifact ships that marker. Without a republish every binary box reads "not built" and
     the reinstall hands back the same stale marker — a dead end no operator can leave."""
     from bot.cli import binary_rebuilds
-    assert binary_rebuilds(COVERS, [finding("extra.meshtastic-cli")]) == ["meshtastic"]
+    assert binary_rebuilds(COVERS, RECORDED, [finding("extra.meshtastic-cli")]) == ["meshtastic"]
 
 
-def test_a_renamed_meshtastic_stack_stops_the_run_instead_of_silently_not_rebuilding():
-    """The rule names a stack. If that name stops existing, failing here is the only way the
-    republish obligation does not vanish quietly."""
-    import pytest
+def test_the_republish_follows_the_stack_that_records_the_input():
+    """The rule is the manifest's own record, not a stack name: a renamed stack is still the one
+    rebuilt, and the obligation cannot vanish with a name."""
+    from bot.cli import binary_rebuilds
+    covers = {"mesh": ("meshtastic",), "meshcom": ("meshcom-qemu",)}
+    recorded = {"mesh": ("meshtastic-web", "meshtastic-cli"), "meshcom": ()}
+    assert binary_rebuilds(covers, recorded, [finding("extra.meshtastic-web")]) == ["mesh"]
 
-    from bot.cli import Stop, binary_rebuilds
-    with pytest.raises(Stop):
-        binary_rebuilds({"meshcom": ("meshcom-qemu",)}, [finding("extra.meshtastic-web")])
+
+def test_a_web_client_that_is_its_own_component_republishes_nothing():
+    """Once the client is no longer a build input of the meshtastic artifact (its own component,
+    fetched or built on its own), moving it leaves every published binary valid."""
+    from bot.cli import binary_rebuilds
+    recorded = {**RECORDED, "meshtastic": ("meshtastic-cli", "meshtastic-decoder-crypto")}
+    assert binary_rebuilds(COVERS, recorded, [finding("extra.meshtastic-web")]) == []
+    assert binary_rebuilds(COVERS, recorded, [finding("extra.meshtastic-cli")]) == ["meshtastic"]
+
+
+MANIFEST_BIN = """
+[[stack]]
+id = "meshtastic"
+  [stack.binary]
+  index_url = "https://github.com/makrohard/lhpc-binaries/releases/download/binaries/{meshtastic}"
+  covers = ["meshtastic"]
+  [[stack.component]]
+  id = "meshtastic"
+  build_inputs = [
+    {{ name = "meshtastic-web", value = "2.7.2", command = "web.sh", token = "{{value}}" }},
+    {{ name = "meshtastic-cli", value = "2.7.8", command = "pip", token = "{{value}}" }},
+  ]
+  [[stack.component]]
+  id = "meshtastic-gps"
+
+[[stack]]
+id = "daemon"
+  [stack.binary]
+  index_url = "https://github.com/makrohard/lhpc-binaries/releases/download/binaries/{daemon}"
+  covers = ["loraham-daemon"]
+  [[stack.component]]
+  id = "loraham-daemon"
+
+[[stack]]
+id = "chat"
+  [[stack.component]]
+  id = "loraham-chat"
+  build_inputs = [ {{ name = "x", value = "1", command = "c", token = "{{value}}" }} ]
+"""
+
+
+def test_the_recorded_inputs_are_read_from_the_covered_components():
+    from bot.manifest import recorded_inputs
+    text = MANIFEST_BIN.format(meshtastic="index.json", daemon="index.json")
+    assert recorded_inputs(text) == {"meshtastic": ("meshtastic-web", "meshtastic-cli"),
+                                     "daemon": ()}
+
+
+# ------------------------------------------------ which index the candidate publishes into
+
+@pytest.mark.parametrize("name", ["index.json", "index-v3.json"])
+def test_the_index_is_the_one_the_candidate_manifest_names(name):
+    from bot.manifest import binary_index
+    assert binary_index(MANIFEST_BIN.format(meshtastic=name, daemon=name)) == name
+
+
+@pytest.mark.parametrize("meshtastic, daemon", [
+    ("index.json", "index-v3.json"),            # two stacks, two indexes
+    ("index.prev.json", "index.prev.json"),     # not an index a publish writes
+    ("SHA256SUMS", "SHA256SUMS")])
+def test_an_index_the_bot_cannot_name_stops_the_plan(meshtastic, daemon):
+    from bot.manifest import Unreadable, binary_index
+    with pytest.raises(Unreadable):
+        binary_index(MANIFEST_BIN.format(meshtastic=meshtastic, daemon=daemon))
+
+
+def test_an_index_in_another_repository_stops_the_plan():
+    from bot.manifest import Unreadable, binary_index
+    text = MANIFEST_BIN.format(meshtastic="index.json", daemon="index.json").replace(
+        "makrohard/lhpc-binaries", "someone/else")
+    with pytest.raises(Unreadable):
+        binary_index(text)
+
+
+# ------------------------------------------------ the history index (index-v3.json)
+
+def v3entry(sha="a", pin="b", inputs="f", published="2026-10-16T08:00:00Z"):
+    return {**entry(sha), "components": {"meshtastic": pin * 40}, "target": "aarch64-trixie",
+            "inputs": {"meshtastic": inputs * 64}, "published_at": published}
+
+
+def core(e):
+    """The entry as the build's fragment states it: the publisher adds the other two fields."""
+    return {k: v for k, v in e.items() if k not in ("inputs", "published_at")}
+
+
+def test_v3_our_build_must_be_the_newest_of_its_stack():
+    from bot.cli import published_first
+    mine, older = v3entry("6"), v3entry("8", pin="7")
+    assert published_first({"meshtastic": [mine, older]}, "meshtastic", core(mine))
+    assert not published_first({"meshtastic": [older, mine]}, "meshtastic", core(mine))
+    assert not published_first({"meshtastic": []}, "meshtastic", core(mine))
+    assert not published_first({}, "meshtastic", core(mine))
+
+
+def test_v3_an_entry_that_differs_in_provenance_is_not_ours():
+    from bot.cli import published_first
+    mine = v3entry("6")
+    twin = dict(mine, lhpc_commit="7" * 40)
+    assert not published_first({"meshtastic": [twin]}, "meshtastic", core(mine))
+
+
+def test_v3_recover_leaves_a_new_composition_where_it_is():
+    """Nothing to undo: only a controller with exactly these pins and inputs selects it, and no
+    released one has them."""
+    from bot.cli import reconcile_v3
+    mine, old = v3entry("6", pin="2"), v3entry("8")
+    noop, conflicts = reconcile_v3(["meshtastic"], {"meshtastic": core(mine)},
+                                   {"meshtastic": [mine, old]}, {"meshtastic": [old]})
+    assert (noop, conflicts) == (["meshtastic"], [])
+
+
+def test_v3_recover_stops_when_our_build_replaced_a_published_composition():
+    """The one case history cannot absorb: a rebuild of a composition an older controller already
+    selects replaced that controller's proven entry, and B1 has no v3 rollback."""
+    from bot.cli import reconcile_v3
+    old = v3entry("8")
+    mine = v3entry("6", published="2026-10-16T09:00:00Z")          # same pins, same inputs
+    noop, conflicts = reconcile_v3(["meshtastic"], {"meshtastic": core(mine)},
+                                   {"meshtastic": [mine]}, {"meshtastic": [old]})
+    assert (noop, conflicts) == ([], ["meshtastic"])
+
+
+def test_v3_recover_treats_an_unknown_outcome_as_a_conflict():
+    from bot.cli import reconcile_v3
+    old, foreign = v3entry("8"), v3entry("f", pin="9")
+    noop, conflicts = reconcile_v3(["meshtastic"], {}, {"meshtastic": [foreign, old]},
+                                   {"meshtastic": [old]})
+    assert (noop, conflicts) == ([], ["meshtastic"])
+
+
+def test_v3_recover_after_no_publish_is_a_verified_no_op():
+    from bot.cli import reconcile_v3
+    old = v3entry("8")
+    assert reconcile_v3(["meshtastic"], {}, {"meshtastic": [old]},
+                        {"meshtastic": [old]}) == (["meshtastic"], [])
+    mine = v3entry("6", pin="2")                       # recorded, but never reached the index
+    assert reconcile_v3(["meshtastic"], {"meshtastic": core(mine)}, {"meshtastic": [old]},
+                        {"meshtastic": [old]}) == (["meshtastic"], [])
 
 
 def test_several_moves_are_folded_into_one_rebuild_set():
     from bot.cli import binary_rebuilds
     moved = [finding("extra.meshtastic-web"), finding("src/meshtastic-firmware", ["meshtastic"]),
              finding("src/MeshCom-Firmware", ["meshcom-firmware"])]
-    assert binary_rebuilds(COVERS, moved) == ["meshcom", "meshtastic"]
+    assert binary_rebuilds(COVERS, RECORDED, moved) == ["meshcom", "meshtastic"]
 
 
 # ------------------------------------------------- what a build's own fragment must prove
