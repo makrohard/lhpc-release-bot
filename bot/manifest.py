@@ -204,6 +204,16 @@ def components_of(manifest_text: str) -> dict:
     return {c["id"]: st["id"] for st in doc.get("stack", []) for c in st.get("component", [])}
 
 
+def component_pin(manifest_text: str, comp_id: str) -> str:
+    """The full-sha `pin_commit` of component `comp_id`; Unreadable when it has none."""
+    doc = tomllib.loads(manifest_text)
+    pins = {(c.get("source") or {}).get("pin_commit", "")
+            for st in doc.get("stack", []) for c in st.get("component", []) if c.get("id") == comp_id}
+    if len(pins) != 1 or not SHA.match(next(iter(pins))):
+        raise Unreadable(f"the manifest records no single pin for {comp_id!r}")
+    return pins.pop()
+
+
 # The Meshtastic browser UI is LHPC's own pin, not a git source: the manifest names a
 # meshtastic/web release and the sha256 of its `build.tar`, and the fetch script verifies that
 # digest on every install. The version appears twice on its line — in the argv and in the

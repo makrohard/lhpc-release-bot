@@ -125,7 +125,8 @@ the channel's typed message and offered the source build. Installed boxes are un
   `GITHUB_TOKEN` writes it. Diagnostics are best-effort; the rest is never omitted.
 - **Something keeps not working, without failing:** one issue labelled `degraded` per state — a
   source skipped as unreachable (`degraded source: <key>`), or a test-lab gate left unproven by an
-  external outage (`degraded gate: <job>`, closed only by a run in which that job succeeded) —
+  external outage (`degraded gate: <job>`, closed only by a run in which that job succeeded), or
+  a web-client channel the `web` stage could not keep current (`degraded web: <key>`) —
   opened at the first run that sees it,
   commented by every later one, titled `PERSISTENT …` from the third, and closed by the first run
   that no longer sees it. It holds, freezes and blocks nothing.
@@ -224,8 +225,16 @@ Actions → **release** → Run workflow:
 | `dry-run` | makes the edit locally, prints the diff and the binaries it would republish, pushes nothing |
 | `finish` | finishes whatever an attempt whose controller release already happened still owes — its `dev` integration, its image, or both |
 | `recover` | undoes an attempt that stopped before the commit point |
+| `web` | keeps the Meshtastic web client's `dev` and `stable` builds current (below); the schedule runs it after the release stages |
+| `web-dry-run` | prints what `web` would build, dispatches nothing, writes no issue |
 
 `finish` and `recover` take the attempt's run id, which the attempt issue names.
+
+The `web` stage asks, per channel, which `meshtastic-web` entry in `index-v3.json` a box would take — the
+first with that channel and `main`'s meshtasticd pin — and builds the channel when that entry is
+missing or is not upstream `main` (dev) or the newest release's commit (stable). An older entry
+further down the history does not count. It holds no attempt and never fails the run; a problem
+is a `degraded web: <key>` issue (`web/index`, `web/upstream`, `web/dev`, `web/stable`).
 
 There is one further input, `lhpc_ref`, and it is **not** for ordinary use. It names the
 controller ref an attempt is planned from; empty — which is every real release — means `main`. It

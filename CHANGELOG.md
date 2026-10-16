@@ -7,6 +7,8 @@ Milestones only.
 - Binaries go into the index the candidate's manifest names: `index.json`, or the history
   `index-v3.json`. A web-client move republishes only an artifact that still records it; a dry
   run shows which.
+- New `web` stage (weekly, or mode `web`): rebuilds the Meshtastic web client's `dev` or `stable`
+  build when the one a box would take is not upstream's current commit; problems open an issue.
 
 ## 0.1.0
 

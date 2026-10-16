@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import zipfile
 from dataclasses import asdict
@@ -26,6 +27,7 @@ from . import changelog as cl
 from . import manifest as mf
 from . import report as rp
 from . import upstream as up
+from . import web
 from .attempt import (
     LABEL,
     OPEN_STATES,
@@ -70,7 +72,7 @@ REQUIRED_CI = ("test (3.11)", "test (3.12)", "test (3.13)", "pin-validation", "m
 REQUIRED_TESTLAB = ("testlab", "release-verify", "slow-build")
 
 BOUNDS = {"ci": 40 * 60, "binary": 190 * 60, "testlab": 280 * 60, "image": 330 * 60,
-          "settle": 60 * 60}
+          "settle": 60 * 60, "web": 320 * 60}
 # The release lane's own case count. A lane that reports fewer has lost cases, whatever its
 # colour; the exact names are the lane's contract and are checked individually.
 # Where the controller states which lane cases a release requires. Read from the CANDIDATE,
@@ -2308,13 +2310,129 @@ def _auto_freeze(ctx: Ctx, number: int, att: Attempt) -> None:
 # ---------------------------------------------------------------------------- entry point
 
 
+# ---------------------------------------------------------------------------- stage: web
+
+
+WEB_UPSTREAM = "https://github.com/meshtastic/web"
+
+
+def _ls_remote(ref: str) -> str:
+    r = subprocess.run(["git", "ls-remote", WEB_UPSTREAM, ref], capture_output=True, text=True,
+                       check=False, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"git ls-remote {ref}: {r.stderr.strip()[:200]}")
+    return r.stdout
+
+
+def _web_upstream(ctx: Ctx) -> tuple:
+    """({channel: wanted web commit} for each channel read, [problem]). dev = upstream `main`;
+    stable = the newest release's peeled commit — read as the builder reads them."""
+    want, problems = {}, []
+    try:
+        head = (_ls_remote("refs/heads/main").split("\t", 1) + [""])[0].strip()
+        if not mf.SHA.match(head):
+            raise RuntimeError(f"no commit for main ({head[:40]!r})")
+        want["dev"] = head
+    except Exception as exc:                                       # noqa: BLE001
+        problems.append(f"upstream main could not be read: {exc}")
+    try:
+        tag = str(ctx.gh.get("/repos/meshtastic/web/releases/latest").get("tag_name", ""))
+        if not web.RELEASE_TAG.match(tag):
+            raise RuntimeError(f"unexpected release tag {tag[:40]!r}")
+        commit = web.peeled_commit(_ls_remote(f"refs/tags/{tag}*"), tag)
+        if not commit:
+            raise RuntimeError(f"tag {tag} does not resolve to a commit")
+        want["stable"] = commit
+    except Exception as exc:                                       # noqa: BLE001
+        problems.append(f"the newest upstream release could not be read: {exc}")
+    return want, problems
+
+
+def stage_web(ctx: Ctx, dry: bool = False) -> int:
+    """Keep each web-client channel's SELECTED entry current (bot/web.py), on `main`'s pin.
+
+    Independent of the release pipeline: no attempt, no candidate, nothing rolled back. Every
+    problem is a `_degraded` issue of kind `web` with four keys — `web/index` (the index or the
+    daemon entry the smoke runs), `web/upstream` (an upstream read), `web/dev`, `web/stable` (that
+    channel's build or read-back). A channel key is examined only when the index is usable and
+    that channel's upstream commit was read; a run that stopped earlier leaves its issue as it is.
+    Web, build and read-back problems are converted to degraded keys; the previous proven entry
+    stays the one boxes take. An unexpected stage failure is isolated from the release workflow
+    by the job's `continue-on-error`."""
+    seen, examined = {}, {"web/index", "web/upstream"}
+    entries, daemon, pin, main_sha = [], False, "", ""
+    try:
+        main_sha = ctx.gh.ref(LHPC, "heads/main")
+        pin = mf.component_pin(ctx.gh.file_at(LHPC, MANIFEST, main_sha), "meshtastic")
+        stacks = _live_index(ctx, "index-v3.json").get("stacks", {})
+        entries = stacks.get(web.STACK, [])
+        daemon = web.has_daemon_entry(stacks.get("meshtastic", []), pin)
+        if not isinstance(entries, list) or not all(
+                isinstance(e, dict) and isinstance(e.get("components"), dict) for e in entries):
+            raise ValueError(f"stacks[{web.STACK!r}] is not a list of entries with a components map")
+        if not daemon:
+            seen["web/index"] = f"index-v3.json has no meshtastic entry for the pin {pin[:9]}"
+    except Exception as exc:                                       # noqa: BLE001
+        seen["web/index"] = f"main's pin or index-v3.json could not be read: {exc}"
+    want, problems = _web_upstream(ctx)
+    if problems:
+        seen["web/upstream"] = "; ".join(problems)
+    todo = []
+    if "web/index" not in seen:
+        todo = web.web_dispatches(pin, want, entries, daemon)
+        examined |= {f"web/{ch}" for ch in want}       # only once the selection has succeeded
+    ctx.summary(f"## web\n\nmeshtastic pin `{pin[:9] or '?'}`; wanted "
+                + (", ".join(f"{ch} `{c[:9]}`" for ch, c in want.items()) or "nothing read")
+                + f"; to build: {', '.join(todo) or 'nothing'}"
+                + "".join(f"\n- {k}: {v}" for k, v in sorted(seen.items())))
+    if dry:
+        print("dry run: nothing dispatched, no issue written")
+        return 0
+    deadline = time.monotonic() + BOUNDS["web"]
+    runs = {}
+    for ch in todo:
+        try:
+            runs[ch] = ctx.gh.dispatch(BIN, BUILD_WORKFLOW, "main",
+                                       {"stack": web.STACK, "source_commit": "", "lhpc_ref": main_sha,
+                                        "smoke_test": "true", "channel": ch})
+        except Exception as exc:                                   # noqa: BLE001
+            seen[f"web/{ch}"] = f"the {ch} build could not be dispatched: {exc}"
+    for ch, run_id in runs.items():
+        try:
+            run = ctx.gh.wait(BIN, run_id, max(0.0, deadline - time.monotonic()))
+            url = run.get("html_url", f"run {run_id}")
+            if run.get("timed_out"):
+                seen[f"web/{ch}"] = f"the {ch} build did not finish within its bound ({url})"
+            elif run.get("conclusion") != "success":
+                seen[f"web/{ch}"] = f"the {ch} build ended {run.get('conclusion')} ({url})"
+            else:
+                after = _live_index(ctx, "index-v3.json").get("stacks", {}).get(web.STACK, [])
+                if not web.is_current(after, ch, pin, want[ch]):
+                    seen[f"web/{ch}"] = (f"the {ch} build succeeded ({url}) but the entry boxes "
+                                         f"select is not {want[ch][:9]} with {pin[:9]}")
+                else:
+                    ctx.summary(f"published {ch}: {want[ch][:9]} with meshtasticd {pin[:9]} ({url})")
+        except Exception as exc:                                   # noqa: BLE001
+            seen[f"web/{ch}"] = f"the {ch} build could not be followed: {exc}"
+    _degraded(ctx, "web", seen, examined)
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="bot")
     ap.add_argument("stage", choices=("plan", "build", "prove", "release", "integrate",
-                                      "image", "finalize", "recover"))
+                                      "image", "finalize", "recover", "web"))
     ap.add_argument("--attempt", default="")
+    ap.add_argument("--dry-run", action="store_true", help="web: print the decision only")
     args = ap.parse_args(argv)
     ctx = Ctx()
+    if args.stage == "web":
+        # Not the release's error path: the web stage holds no attempt; an unexpected failure
+        # ends only this job, which `continue-on-error` keeps out of the run's result.
+        try:
+            return stage_web(ctx, dry=args.dry_run)
+        finally:
+            shutil.rmtree(ctx.work, ignore_errors=True)
     try:
         if args.stage == "recover":
             return stage_recover(ctx, args.attempt)
