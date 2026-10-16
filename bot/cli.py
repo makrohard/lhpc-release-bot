@@ -25,6 +25,7 @@ from pathlib import Path
 from . import autofreeze as af
 from . import changelog as cl
 from . import manifest as mf
+from . import pins_check as pins
 from . import report as rp
 from . import upstream as up
 from . import web
@@ -564,6 +565,13 @@ def stage_plan(ctx: Ctx) -> int:
         raise Stop("prepare", f"the edited manifest fails LHPC's own pin contract:\n\n```\n"
                    f"{check.stderr.strip()[:1000]}\n```",
                    "Nothing was pushed. Fix the edit rule in `bot/manifest.py`.")
+    # LHPC's own Python pins (bot/pins_check.py): checked here, before anything is pushed.
+    try:
+        clock = pins.Clock()                       # one bound for both checks
+        ctx.summary(pins.check_constraints(lhpc, manifest_p.read_text(), moved, clock=clock))
+    except pins.CheckFailed as exc:
+        ctx.summary(exc.detail)                    # the issue gets it as diagnostics; so does this
+        raise Stop("prepare", exc.observed, exc.next_action, exc.detail) from None
 
     # The binaries index this candidate's builds publish into is the one ITS manifest names.
     try:
@@ -620,8 +628,8 @@ def stage_plan(ctx: Ctx) -> int:
 # mid-image leaves a released controller with no image and no credential to repair it — the one
 # state this check exists to prevent:
 #
-#   plan 30 + build 210 x 2 stacks (max-parallel: 1) + prove 300 + release 20 + integrate 20
-#   + image 350 + finalize 20 + recover 150  =  1310 min  =  21.8 h
+#   plan 35 + build 210 x 2 stacks (max-parallel: 1) + prove 300 + release 20 + integrate 20
+#   + image 350 + finalize 20 + recover 150  =  1315 min  =  21.9 h
 #
 # Two stacks, not three: the daemon's sources are all `manual` in policy, so the bot can only
 # ever dispatch meshtastic and meshcom. `tests/test_proof.py` re-derives this from the workflow
