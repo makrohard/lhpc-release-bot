@@ -7,6 +7,8 @@ Milestones only.
 - Binaries go into the index the candidate's manifest names: `index.json`, or the history
   `index-v3.json`. A web-client move republishes only an artifact that still records it; a dry
   run shows which.
+- The plan stops before pushing anything when a moved component raised a dependency floor its
+  LHPC constraints file does not allow, naming the requirement and the pin.
 
 ## 0.1.0
 
