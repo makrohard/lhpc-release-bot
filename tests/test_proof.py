@@ -750,3 +750,35 @@ def test_a_gate_report_that_cannot_read_its_jobs_never_stops_prove():
     with pytest.raises(cli.Stop) as stop:
         cli.stage_prove(ctx)
     assert "the candidate is not proven" in stop.value.observed
+
+
+# ---- a non-required qualification step never decides the proof ----
+
+class _Qualifying(_ProveCtx):
+    """The MeshCom row runs as the LAST step of release-verify with step-level continue-on-error:
+    when it fails, GitHub still reports the job (and the run) as success, and its JUnit goes to
+    its own artifact. Records which artifacts the bot asks for."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.asked = []
+
+    def artifact_member(self, repo, run_id, name, member, attempt=1):
+        self.asked.append((name, member))
+        cases = "".join(f'<testcase name="{c}"></testcase>' for c in REQUIRED_CASES)
+        return f"<testsuite>{cases}</testsuite>".encode()
+
+
+@pytest.mark.parametrize("lane, proven", [("success", True), ("failure", False)])
+def test_the_bot_reads_job_conclusions_and_junit_release_only(lane, proven):
+    from bot import cli
+    green = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in cli.REQUIRED_CI]
+    lab = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in cli.REQUIRED_TESTLAB]
+    lab = [dict(j, conclusion=lane) if j["name"] == cli.LANE_JOB else j for j in lab]
+    ctx = _Qualifying(jobs_by_run={5: green, 6: lab})
+    if proven:
+        assert cli.stage_prove(ctx) == 0
+    else:
+        with pytest.raises(cli.Stop):
+            cli.stage_prove(ctx)
+    assert {m for _n, m in ctx.asked} == {"junit-release.xml"}      # never the row's own JUnit
