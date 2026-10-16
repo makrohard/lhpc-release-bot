@@ -84,7 +84,7 @@ proved.
 
 | stage | what it changes | what stops it |
 |---|---|---|
-| plan | pushes a candidate branch | no access, an unresolved earlier attempt, a policy gap, an upstream fault, nothing moved, a moved component whose new commit requires what its LHPC constraints file does not allow (resolved with pip on Python 3.13; the stop names the requirement and the pin, and the bot never edits a constraints file) |
+| plan | pushes a candidate branch | no access, an unresolved earlier attempt, a policy gap, an upstream fault, nothing moved, a moved component whose new commit requires what its LHPC constraints file does not allow (resolved with pip on Python 3.13; the stop names the requirement and the pin, and the bot never edits a constraints file), or LHPC's `requirements.lock` that is not what its pyproject resolves to on Python 3.13 (compared by content: name, version, marker, hashes; the bot never writes the lock) |
 | build | publishes the candidate binaries | a build, its smoke test or its clean-runtime test |
 | prove | nothing | any required job on the candidate that is not `success`, or any release-lane case the candidate requires by name that did not pass — missing and skipped included |
 | release | `main` and its tag, in ONE atomic push; the candidate branch is removed | `main` moved meanwhile, or the tag exists |
