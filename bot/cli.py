@@ -568,6 +568,7 @@ def stage_plan(ctx: Ctx) -> int:
     # LHPC's own Python pins (bot/pins_check.py): checked here, before anything is pushed.
     try:
         clock = pins.Clock()                       # one bound for both checks
+        ctx.summary(pins.check_lock(lhpc, clock=clock))
         ctx.summary(pins.check_constraints(lhpc, manifest_p.read_text(), moved, clock=clock))
     except pins.CheckFailed as exc:
         ctx.summary(exc.detail)                    # the issue gets it as diagnostics; so does this
