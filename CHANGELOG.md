@@ -11,6 +11,8 @@ Milestones only.
   build when the one a box would take is not upstream's current commit; problems open an issue.
 - A release cut from a `main` that carries LHPC's `## Unreleased` section turns that section into
   the release (the moves first), so its notes hold dev's items too.
+- The plan stops before pushing anything when a moved component raised a dependency floor its
+  LHPC constraints file does not allow, naming the requirement and the pin where provable.
 
 ## 0.1.0
 
