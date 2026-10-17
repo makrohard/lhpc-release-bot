@@ -7,6 +7,8 @@ Milestones only.
 - Binaries go into the index the candidate's manifest names: `index.json`, or the history
   `index-v3.json`. A web-client move republishes only an artifact that still records it; a dry
   run shows which.
+- A release cut from a `main` that carries LHPC's `## Unreleased` section turns that section into
+  the release (the moves first), so its notes hold dev's items too.
 
 ## 0.1.0
 

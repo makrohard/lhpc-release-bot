@@ -58,6 +58,40 @@ def test_section_of_reads_back_exactly_that_release():
     assert section_of(out, "9.9.9") == ""
 
 
+# LHPC `dev` collects a release under `## Unreleased` (with its own Fixed/Changed groups); a bot
+# release cut from a `main` that fast-forwarded to such a `dev` carries those items.
+DEV_SHAPED = """# Changelog
+
+## Unreleased
+
+Fixed
+
+- a fix dev collected
+
+Changed
+
+- a change dev collected
+
+## 0.3.5
+
+- something released
+"""
+
+
+def test_an_unreleased_section_becomes_the_release_with_the_moves_first():
+    out = insert_section(DEV_SHAPED, "0.3.6", ["moved a pin"])
+    assert "## Unreleased" not in out
+    assert out.startswith("# Changelog\n\n## 0.3.6\n\n- moved a pin\n\nFixed\n")
+    assert out.index("## 0.3.6") < out.index("## 0.3.5")
+    assert section_of(out, "0.3.5") == "- something released"
+
+
+def test_the_release_notes_carry_devs_items_and_the_moves():
+    notes = section_of(insert_section(DEV_SHAPED, "0.3.6", ["moved a pin"]), "0.3.6")
+    assert notes == ("- moved a pin\n\nFixed\n\n- a fix dev collected\n\n"
+                     "Changed\n\n- a change dev collected")
+
+
 def test_version_scalars_move_or_raise():
     assert 'version = "0.3.6"' in set_pyproject_version('version = "0.3.5"\n', "0.3.6")
     assert '__version__ = "0.3.6"' in set_version_module('__version__ = "0.3.5"\n', "0.3.6")
