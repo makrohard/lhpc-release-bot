@@ -9,6 +9,8 @@ Milestones only.
   run shows which.
 - New `web` stage (weekly, or mode `web`): rebuilds the Meshtastic web client's `dev` or `stable`
   build when the one a box would take is not upstream's current commit; problems open an issue.
+- A release cut from a `main` that carries LHPC's `## Unreleased` section turns that section into
+  the release (the moves first), so its notes hold dev's items too.
 
 ## 0.1.0
 

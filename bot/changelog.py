@@ -40,12 +40,23 @@ def current_version(pyproject_text: str) -> str:
     return m.group(1)
 
 
+UNRELEASED = re.compile(r"^## Unreleased[ \t]*\n", re.M)
+
+
 def insert_section(changelog: str, version: str, bullets) -> str:
-    """Put this release's section at the top, under the title, above the previous release."""
+    """Put this release's section at the top, under the title, above the previous release.
+
+    A `## Unreleased` section is what `dev` collected for this release: it is retitled
+    `## <version>` and the bullets go first under the heading, so the release notes are dev's
+    items plus the moves, and nothing shipped stays listed as unreleased."""
     if f"## {version}\n" in changelog:
         raise ValueError(f"the changelog already has a section for {version}")
     body = "".join(f"- {b}\n" for b in bullets)
     section = f"## {version}\n\n{body}\n"
+    m = UNRELEASED.search(changelog)
+    if m:
+        rest = changelog[m.end():].lstrip("\n")
+        return changelog[:m.start()] + section + rest
     m = HEADING.search(changelog)
     if m:
         return changelog[:m.start()] + section + changelog[m.start():]
