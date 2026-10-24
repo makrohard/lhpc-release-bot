@@ -282,7 +282,7 @@ def test_an_unreachable_source_beside_a_move_is_reported_and_the_plan_goes_on(tm
     (tmp_path / "loraham-pi-control" / cli.MANIFEST.split("/")[-1]).write_text("")
     monkeypatch.setattr(cli, "MANIFEST", cli.MANIFEST.split("/")[-1])
     monkeypatch.setattr(cli, "git", lambda *a, **k: "b" * 40)
-    monkeypatch.setattr(cli, "_findings", lambda ctx, text, policy: (found, None))
+    monkeypatch.setattr(cli, "_findings", lambda ctx, text, policy, dev="": (found, None))
     def note(ctx, kind, seen, examined):
         ctx.degraded.append((kind, sorted(seen), sorted(examined)))
     monkeypatch.setattr(cli, "_degraded", note, raising=False)       # absent before the change

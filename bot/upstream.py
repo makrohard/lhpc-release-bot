@@ -151,14 +151,19 @@ def load_policy(path: Path) -> dict:
     return tomllib.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def policy_gaps(policy: dict, pinned_paths) -> list:
+def policy_gaps(policy: dict, pinned_paths, dev_paths=()) -> list:
     """Reasons the policy and the manifest disagree. A new pinned source with no rule is a
-    STOP: it must never be moved by a rule nobody wrote, nor silently left behind."""
+    STOP: it must never be moved by a rule nobody wrote, nor silently left behind.
+
+    `dev_paths` are the sources the controller's `dev` pins. A rule for one of them is not stale
+    although the manifest checked (main) does not pin it yet: a new source's rule must exist
+    BEFORE it reaches dev (the controller's CI checks that), so it is here while main lags. Such
+    a rule is inert — a run examines only what its manifest pins. A rule pinned nowhere stops."""
     declared = set(policy.get("source", {}))
     actual = set(pinned_paths)
     gaps = [f"{p}: pinned in the manifest, absent from policy.toml" for p in sorted(actual - declared)]
     gaps += [f"{p}: in policy.toml, no longer pinned in the manifest"
-             for p in sorted(declared - actual)]
+             for p in sorted(declared - actual - set(dev_paths))]
     # A malformed hold is as fatal as a missing rule, and for the same reason: it decides whether
     # an input moves, so it must never be guessed at.
     return gaps + freeze_problems(policy)

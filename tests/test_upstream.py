@@ -261,3 +261,21 @@ def test_an_unreachable_upstream_is_skipped_and_any_other_read_failure_is_a_faul
                                "1.0.0", _Unreadable(said))
     assert (git_source.status, pypi_extra.status) == (status, status)
     assert not git_source.moves and not pypi_extra.moves
+
+
+# ---- a rule for a source dev pins and main not yet (a new source's rule lands first) ----
+
+def test_a_rule_for_a_source_only_dev_pins_is_not_stale():
+    policy = {"source": {"src/a": {}, "src/new": {"track": "manual", "why": "moves by hand"}}}
+    assert policy_gaps(policy, ["src/a"], ["src/a", "src/new"]) == []
+
+
+def test_a_rule_pinned_neither_on_main_nor_on_dev_still_stops():
+    policy = {"source": {"src/a": {}, "src/gone": {}}}
+    gaps = policy_gaps(policy, ["src/a"], ["src/a"])
+    assert gaps == ["src/gone: in policy.toml, no longer pinned in the manifest"]
+
+
+def test_dev_never_excuses_a_source_main_pins_without_a_rule():
+    gaps = policy_gaps({"source": {"src/a": {}}}, ["src/a", "src/new"], ["src/a", "src/new"])
+    assert gaps == ["src/new: pinned in the manifest, absent from policy.toml"]

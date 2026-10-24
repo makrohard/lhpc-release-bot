@@ -415,11 +415,13 @@ def _plan_ctx(tmp: Path, monkeypatch):
     (lhpc / "lhpc" / "version.py").write_text('__version__ = "0.12.10"\n')
     (lhpc / "CHANGELOG.md").write_text("# Changelog\n\n## 0.12.10\n\n- x\n")
     _git("init", "-q", cwd=lhpc)
+    _git("add", "-A", cwd=lhpc)
     _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base",
          cwd=lhpc)
+    _git("update-ref", "refs/remotes/origin/dev", "HEAD", cwd=lhpc)   # a real clone has dev
     moved = up.Finding(key="src/cli", track="branch", status="move", current="a" * 40,
                        candidate=SHA, remote="https://example.invalid/cli.git")
-    monkeypatch.setattr(cli, "_findings", lambda ctx, text, policy: ([moved], {}))
+    monkeypatch.setattr(cli, "_findings", lambda ctx, text, policy, dev="": ([moved], {}))
     monkeypatch.setattr(cli, "_check_parent", lambda ctx, frozen: None)
     monkeypatch.setattr(cli, "_claim_the_retry", lambda ctx: None)
     return lhpc, _PlanCtx(lhpc)

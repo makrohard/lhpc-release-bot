@@ -287,9 +287,10 @@ def _wait(ctx, rec: dict, bound: float, att: Attempt | None = None, number: int 
     return run
 
 
-def _findings(ctx: Ctx, manifest_text: str, policy: dict) -> tuple:
+def _findings(ctx: Ctx, manifest_text: str, policy: dict, dev_manifest_text: str = "") -> tuple:
     sources = mf.pinned_sources(manifest_text)
-    gaps = up.policy_gaps(policy, [s.path for s in sources])
+    dev = [s.path for s in mf.pinned_sources(dev_manifest_text)] if dev_manifest_text else []
+    gaps = up.policy_gaps(policy, [s.path for s in sources], dev)
     if gaps:
         raise Stop("watch", "policy.toml and the manifest disagree:\n\n"
                    + "\n".join(f"- {g}" for g in gaps),
@@ -466,7 +467,9 @@ def stage_plan(ctx: Ctx) -> int:
     manifest_p = lhpc / MANIFEST
     script_p = lhpc / "lhpc" / "data" / "scripts" / "graywolf-fetch.sh"
     policy = up.load_policy(Path(__file__).resolve().parents[1] / "policy.toml")
-    found, remote = _findings(ctx, manifest_p.read_text(), policy)
+    # dev's manifest, from the same clone: a rule for a source dev pins and main not yet is valid.
+    dev_manifest = git("show", f"origin/dev:{MANIFEST}", cwd=lhpc)
+    found, remote = _findings(ctx, manifest_p.read_text(), policy, dev_manifest)
 
     faults = [f for f in found if f.status == "fault"]
     moved = [f for f in found if f.moves]
