@@ -26,6 +26,10 @@ why = "the same upstream repository as src/loraham-daemon (chat builds from it);
 track = "manual"
 why = "compiled into the daemon; proved only where the daemon is proved"
 
+[source."src/libch341-spi-userspace"]
+track = "manual"
+why = "built into the daemon's Meshstick library from exactly the commit in the daemon's .github/ci/libpinedio.lock; it moves with the daemon pin, by hand"
+
 [source."src/LoRaHAM_Voice"]
 track = "tip"
 
