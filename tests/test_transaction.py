@@ -474,3 +474,218 @@ def test_v3_a_snapshot_of_keys_gives_the_verdicts_of_a_snapshot_of_entries(ours,
     keys = reconcile_v3(["meshtastic"], ours, {"meshtastic": live},
                         {"meshtastic": [entry_key(e) for e in before]})
     assert full == keys == want
+
+
+# ------------------------------------------------ recovery: an unproven attempt's OWN v3 entries
+# Plan part 2, P2 + P5: an entry is the attempt's own only when its `build_run` is the recorded
+# build run's id AND attempt and it agrees with the fragment. An unproven attempt withdraws its
+# own entries (rollback-binary withdraw-v3), reads them back gone, and then reconciles with ONLY
+# those own entries, so a same-file entry of another publisher is a conflict, never ours.
+
+CAND = "c" * 40
+BUILD = {"id": 777, "workflow": 9, "attempt": 1, "sha": "d" * 40}
+
+
+class _RecoverCtx:
+    """`stage_recover` on an index-v3 attempt that published meshtastic. The release (tags,
+    main) does not exist yet; every recorded run is finished. `ci` is the CI run's conclusion;
+    `withdraw` is what the rollback run does: apply / fail / succeed-without-removing."""
+
+    attempt_id = run_id = "100"
+    retry_of = retry_incident = ""
+    run_url = "https://example.invalid/run/100"
+
+    def __init__(self, *, fragment, live, snapshot, ci="failure", withdraw="apply", runs=None):
+        from bot import cli
+        from bot.attempt import Attempt
+        self.cli, self.gh, self.bot_gh = cli, self, self
+        self.index = {"schema": 3, "stacks": {"meshtastic": list(live)}}
+        self.ci, self.withdraw = ci, withdraw
+        self.dispatches, self.saved, self.summaries, self.closed = [], [], [], []
+        self.att = Attempt(
+            run_id="100", state="mutated", version="0.3.16", base_sha="b" * 40,
+            candidate_sha=CAND, binary_index="index-v3.json", dispatched=["meshtastic"],
+            published={"meshtastic": fragment} if fragment else {},
+            index_snapshot={"schema": 3, "stacks": {"meshtastic": [cli.entry_key(e)
+                                                                    for e in snapshot]}},
+            runs={"ci": {"repo": cli.LHPC, "id": 5, "workflow": 42, "attempt": 1, "sha": CAND},
+                  "testlab": {"repo": cli.LHPC, "id": 6, "workflow": 42, "attempt": 1,
+                              "sha": CAND},
+                  "binary:meshtastic": dict(BUILD, repo=cli.BIN), **(runs or {})})
+
+    # --- Ctx
+    def find_attempt(self, wanted=""):
+        return 7, self.att
+
+    def save_attempt(self, number, att):
+        self.saved.append(att.state)
+
+    def summary(self, text):
+        self.summaries.append(text)
+
+    def record_run(self, repo, run_id):
+        return {"repo": repo, "id": int(run_id), "workflow": 11, "attempt": 1, "sha": "e" * 40}
+
+    # --- Gh
+    def ref(self, repo, ref):
+        return "b" * 40 if ref == "heads/main" else ""
+
+    def is_ancestor(self, repo, a, b):
+        return False
+
+    def unfinished_runs(self, repo, workflow=""):
+        return []
+
+    def cancel(self, repo, run_id):
+        pass
+
+    def wait(self, repo, run_id, bound, poll_s=30.0, rerun=True, external=None):
+        assert rerun is False, "recovery judges and settles runs; it never re-runs a job"
+        conclusion = {5: self.ci, 900: "failure" if self.withdraw == "fail" else "success"}.get(
+            int(run_id), "success")
+        return {"status": "completed", "conclusion": conclusion, "head_sha": CAND,
+                "workflow_id": 42, "run_attempt": 1, "html_url": f"https://example.invalid/{run_id}"}
+
+    def jobs(self, repo, run_id, attempt=1):
+        names = self.cli.REQUIRED_CI if int(run_id) == 5 else self.cli.REQUIRED_TESTLAB
+        state = self.ci if int(run_id) == 5 else "success"
+        return [{"name": n, "conclusion": state, "head_sha": CAND} for n in names]
+
+    def failing_jobs(self, repo, run_id, attempt, lines=20):
+        return []
+
+    def artifact_member(self, repo, run_id, name, member, attempt=1):
+        return b'<testsuite><testcase name="test_release_kiss"></testcase></testsuite>'
+
+    def file_at(self, repo, path, sha):
+        import json
+        return json.dumps({"required_cases": ["test_release_kiss"]})
+
+    def release_asset(self, repo, tag, name):
+        import json
+        assert name == "index-v3.json"
+        return json.dumps(self.index).encode()
+
+    def dispatch(self, repo, workflow, ref, inputs=None):
+        import json
+        self.dispatches.append((workflow, dict(inputs or {})))
+        assert workflow == "rollback.yml" and inputs["mode"] == "withdraw-v3"
+        if self.withdraw == "apply":
+            keys = json.loads(inputs["keys_json"])
+            for stack, gone in keys.items():
+                self.index["stacks"][stack] = [e for e in self.index["stacks"][stack]
+                                               if self.cli.entry_key(e) not in gone]
+        return 900
+
+    def update_issue(self, repo, number, **fields):
+        self.closed.append(fields.get("state"))
+        return {}
+
+
+def _own(sha="6", run="777.1", **over):
+    """This attempt's meshtastic build as the index holds it after S1: a new composition."""
+    e = dict(v3entry(sha, pin="2", inputs="3"), **over)
+    if run is not None:
+        e["build_run"] = run
+    return e
+
+
+def _recover(ctx):
+    from bot import cli
+    return cli.stage_recover(ctx, "100")
+
+
+def test_an_unproven_attempt_withdraws_its_own_entry_and_closes():
+    """CI red, the lane green: not proven (the prove stage's own verdict). The own entry goes,
+    the index reads back as the snapshot, and the attempt is restored and closed."""
+    old, mine = v3entry("8"), _own()
+    ctx = _RecoverCtx(fragment=core(mine), live=[mine, old], snapshot=[old])
+    assert _recover(ctx) == 0
+    import json
+
+    from bot.cli import entry_key
+    (workflow, inputs), = ctx.dispatches
+    assert inputs["stacks"] == "meshtastic"
+    assert json.loads(inputs["keys_json"]) == {"meshtastic": [entry_key(mine)]}
+    assert ctx.index["stacks"]["meshtastic"] == [old]
+    assert ctx.att.runs["rollback"]["id"] == 900 and ctx.att.state == "restored"
+    assert ctx.closed == ["closed"]
+
+
+def test_a_proven_attempt_keeps_its_binary():
+    """His Q1 is about UNPROVEN binaries only: a proven attempt in recovery withdraws nothing."""
+    old, mine = v3entry("8"), _own()
+    ctx = _RecoverCtx(fragment=core(mine), live=[mine, old], snapshot=[old], ci="success")
+    assert _recover(ctx) == 0
+    assert ctx.dispatches == [] and ctx.index["stacks"]["meshtastic"] == [mine, old]
+
+
+@pytest.mark.parametrize("run", [
+    "888.1",        # another publisher's run with the identical file, sha256, inputs, published_at
+    "777.2",        # the same run id, another attempt: a re-run this bot did not ask for
+])
+def test_the_same_build_published_by_another_run_is_never_ours(run):
+    """No own entry, so nothing is withdrawn; the history changed, so the attempt stays open."""
+    old, theirs = v3entry("8"), _own(run=run)
+    ctx = _RecoverCtx(fragment=core(theirs), live=[theirs, old], snapshot=[old])
+    from bot import cli
+    with pytest.raises(cli.Stop, match="cannot claim"):
+        _recover(ctx)
+    assert ctx.dispatches == [] and ctx.index["stacks"]["meshtastic"] == [theirs, old]
+    assert ctx.att.state == "mutated" and ctx.closed == []
+
+
+def test_an_unproven_rebuild_that_replaced_a_proven_entry_is_withdrawn_and_names_the_lost_one():
+    """E1 (ours, unproven) replaced E0 (same composition) in the history. E1 goes; E0 cannot come
+    back (there is no v3 restore), so the attempt stays open and the Stop names E0 by its
+    snapshot key."""
+    e0 = v3entry("8", pin="2", inputs="3")
+    e1 = _own(published="2026-10-16T09:00:00Z")
+    ctx = _RecoverCtx(fragment=core(e1), live=[e1], snapshot=[e0])
+    from bot import cli
+    with pytest.raises(cli.Stop) as stop:
+        _recover(ctx)
+    assert ctx.index["stacks"]["meshtastic"] == []
+    assert f"{e0['filename']} (sha256 {e0['sha256']})" in stop.value.observed
+    assert e1["filename"] not in stop.value.observed
+    assert ctx.att.state == "mutated"
+
+
+def test_a_recovery_after_an_interrupted_withdrawal_waits_for_it_and_does_not_withdraw_again():
+    """The last recover stopped while its withdraw run was going; the run finished and removed
+    the entry. This one settles that run first, then finds nothing of ours left."""
+    from bot import cli
+    old = v3entry("8")
+    mine = _own()
+    ctx = _RecoverCtx(fragment=core(mine), live=[old], snapshot=[old],
+                      runs={"rollback": {"repo": cli.BIN, "id": 900, "workflow": 11,
+                                         "attempt": 1}})
+    waited = []
+    wait = ctx.wait
+    ctx.wait = lambda repo, run_id, bound, **kw: waited.append(int(run_id)) or wait(
+        repo, run_id, bound, **kw)
+    assert _recover(ctx) == 0
+    assert 900 in waited and ctx.dispatches == [] and ctx.att.state == "restored"
+
+
+@pytest.mark.parametrize("withdraw, said", [
+    ("fail", "could not be withdrawn"),
+    ("noop", "still holds this attempt's entry"),
+])
+def test_a_withdrawal_that_is_not_confirmed_keeps_the_attempt_open(withdraw, said):
+    from bot import cli
+    old, mine = v3entry("8"), _own()
+    ctx = _RecoverCtx(fragment=core(mine), live=[mine, old], snapshot=[old], withdraw=withdraw)
+    with pytest.raises(cli.Stop, match=said):
+        _recover(ctx)
+    assert len(ctx.dispatches) == 1 and ctx.att.state == "mutated" and ctx.closed == []
+
+
+def test_an_own_entry_from_before_build_run_stops_without_a_withdrawal():
+    """Published before the publisher wrote `build_run`: ours or another run's, nobody can tell."""
+    from bot import cli
+    old, legacy = v3entry("8"), _own(run=None)
+    ctx = _RecoverCtx(fragment=core(legacy), live=[legacy, old], snapshot=[old])
+    with pytest.raises(cli.Stop, match="without the run that published it"):
+        _recover(ctx)
+    assert ctx.dispatches == [] and ctx.att.state == "mutated"

@@ -4,6 +4,8 @@ Milestones only.
 
 ## Unreleased
 
+- Recovery withdraws an unproven attempt's own binaries from index-v3.json (installed copies stay);
+  a same-file entry of another run, or one without `build_run`, stays and the attempt stays open.
 - A re-run of the build stage waits on the build it recorded instead of dispatching a second
   publisher of the same stack.
 - A scheduled run pushes one empty "heartbeat" commit when this repository's main has had no

@@ -1170,6 +1170,22 @@ def _same_build(a: dict, b: dict) -> bool:
     return _canon(core(a)) == _canon(core(b))
 
 
+def own_entry(att, stack: str, history) -> tuple:
+    """`(entry, legacy)`: this attempt's OWN live entry of `stack`, positively: its `build_run`
+    is the recorded build run's id AND attempt, and it agrees with the fragment on everything the
+    fragment states. An entry of the same build that someone else published (another run, or a
+    re-run this bot did not ask for) is not ours. `legacy`: no own entry, but one that matches the
+    fragment carries no `build_run` (published before the publisher wrote it), so whose it is
+    cannot be told."""
+    rec, frag = att.runs.get(f"binary:{stack}"), att.published.get(stack)
+    if not isinstance(rec, dict) or not frag:
+        return None, False
+    run = f"{rec['id']}.{rec.get('attempt', 1)}"
+    same = [e for e in history or [] if _same_build(e, frag)]
+    own = next((e for e in same if e.get("build_run") == run), None)
+    return own, own is None and any("build_run" not in e for e in same)
+
+
 def _ours_in(history: list, mine: dict):
     """This attempt's entry in a stack's index-v3 history (by filename and digest), or None."""
     for e in history or []:
@@ -1327,11 +1343,14 @@ def _live_index(ctx: Ctx, name: str) -> dict:
 # ---------------------------------------------------------------------------- stage: prove
 
 
-def prove_verdict(ctx: Ctx, att: Attempt, number: int) -> tuple:
+def prove_verdict(ctx: Ctx, att: Attempt, number: int, settled: bool = False) -> tuple:
     """`(problems, lane_only, junit)`: THE judgement of this attempt's recorded CI and testlab runs
     (identity, off-lane, outcome, the release lane's JUnit cases). `stage_prove` and recovery
     both ask it, so "proven" means one thing. `lane_only`: the lane's own cases were red and
-    nothing questions the runs' identity, the only shape that may name a stack."""
+    nothing questions the runs' identity, the only shape that may name a stack.
+
+    `settled` (recovery): the runs are judged as they stand after recovery cancelled them; no
+    failed job is re-run and no degraded-gate report is written. The judgement is the same."""
     identity, outcome = [], []
     for name, required, bound in (("ci", REQUIRED_CI, BOUNDS["ci"]),
                                   ("testlab", REQUIRED_TESTLAB, BOUNDS["testlab"])):
@@ -1339,10 +1358,11 @@ def prove_verdict(ctx: Ctx, att: Attempt, number: int) -> tuple:
         if not rec:
             identity.append(f"{name}: this attempt never recorded a run")
             continue
-        run = _wait(ctx, rec, bound, att, number, external=(name == "testlab"))
+        run = (ctx.gh.wait(rec["repo"], int(rec["id"]), BOUNDS["settle"], poll_s=15, rerun=False)
+               if settled else _wait(ctx, rec, bound, att, number, external=(name == "testlab")))
         got_identity, got_offlane, got_outcome = _run_problems(ctx, att, name, rec, run,
                                                                 required)
-        if name == "testlab" and not run.get("timed_out"):
+        if name == "testlab" and not run.get("timed_out") and not settled:
             # A transfer that stayed unavailable through every re-run proves nothing either way:
             # `unproven, external` — in identity, so it can never attribute a stack. It is
             # retried by the next scheduled run, and its gate is reported as degraded.
@@ -2088,6 +2108,62 @@ def stage_finalize(ctx: Ctx) -> int:
 # ---------------------------------------------------------------------------- stage: recover
 
 
+def _replaced(stack: str, live: dict, snapshot: dict) -> str:
+    """A v3 conflict line: the stack, and each snapshot entry no longer in the index, by its key."""
+    now = [entry_key(e)[:2] for e in live.get(stack) or []]
+    gone = [k for k in (entry_key(e) for e in snapshot.get(stack) or []) if k[:2] not in now]
+    return stack + "".join(f"; the snapshot's {k[0]} (sha256 {k[1]}) is no longer in the index"
+                           for k in gone)
+
+
+def _withdraw_unproven(ctx: Ctx, number: int, att: Attempt, live: dict) -> dict:
+    """An attempt that is NOT proven (`prove_verdict`) takes its own live index-v3 entries out
+    (rollback-binary `withdraw-v3`, recorded as `rollback`), and the index is read back. Returns
+    the index as it now is. A proven attempt keeps its binaries; installed copies stay either
+    way. An own entry published before `build_run` existed cannot be told from a foreign one,
+    so it stops recovery for a person to decide."""
+    if not att.dispatched or not prove_verdict(ctx, att, number, settled=True)[0]:
+        return live
+    owned = {s: own_entry(att, s, live.get(s)) for s in att.dispatched}
+    legacy = sorted(s for s, (e, old) in owned.items() if old)
+    if legacy:
+        att.notes.append("recovery stopped: the live entry of " + ", ".join(legacy)
+                         + " matches this attempt's build but names no build_run")
+        ctx.save_attempt(number, att)
+        raise Stop("recover", "this attempt is not proven, and its build of " + ", ".join(legacy)
+                   + " is live without the run that published it (published before "
+                   "`build_run`), so it cannot be told from somebody else's.",
+                   "Nothing was withdrawn. The attempt stays open; withdraw the entry by hand "
+                   "(rollback-binary, mode withdraw-v3) or keep it, then settle the attempt.")
+    keys = {s: [entry_key(e)] for s, (e, _) in owned.items() if e}
+    if not keys:
+        return live
+    rb = ctx.gh.dispatch(BIN, "rollback.yml", "main", {
+        "stacks": ",".join(sorted(keys)), "mode": "withdraw-v3", "keys_json": json.dumps(keys)})
+    att.runs["rollback"] = ctx.record_run(BIN, rb)          # recorded BEFORE the wait
+    ctx.save_attempt(number, att)
+    run = ctx.gh.wait(BIN, rb, BOUNDS["settle"], poll_s=15, rerun=False)
+    if run.get("conclusion") != "success":
+        att.notes.append(f"WITHDRAWAL NOT CONFIRMED: {run.get('html_url')}")
+        ctx.save_attempt(number, att)
+        raise Stop("recover", "this attempt's unproven binaries could not be withdrawn from "
+                   "index-v3.json.", "The attempt stays open and blocks new releases. Inspect "
+                   "the rollback run, then re-run `recover`.", detail=run.get("html_url", ""))
+    live = _live_index(ctx, att.binary_index).get("stacks", {})
+    still = sorted(s for s, k in keys.items() if k[0] in [entry_key(e) for e in live.get(s) or []])
+    if still:
+        att.notes.append("withdrawal reported success but the index still holds "
+                         + ", ".join(still))
+        ctx.save_attempt(number, att)
+        raise Stop("recover", "the index read back still holds this attempt's entry for "
+                   + ", ".join(still) + ".", "The attempt stays open. Inspect the rolling "
+                   "release by hand.")
+    att.notes.append("withdrawn, not proven: " + ", ".join(
+        f"{s} {k[0][0]}" for s, k in sorted(keys.items())))
+    ctx.save_attempt(number, att)
+    return live
+
+
 def stage_recover(ctx: Ctx, run_id: str = "") -> int:
     """Undo what this attempt changed — but only what is provably still this attempt's, and
     only after every writer it started has stopped.
@@ -2188,12 +2264,17 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
                 ctx.save_attempt(number, att)
     ours = dict(att.published)
     if att.binary_index == "index-v3.json":
-        # A history, not a pointer: nothing is restored (there is no v3 rollback). An entry of a
-        # NEW composition stays where it is; only a replaced one is a conflict.
+        # A history, not a pointer: nothing is restored. An unproven attempt's OWN entries leave
+        # it first; then an entry of a NEW composition stays where it is, and a replaced one is a
+        # conflict. Only an entry positively ours counts as ours: a same-file entry of another
+        # publisher is a changed history, so a conflict.
+        live = _withdraw_unproven(ctx, number, att, live)
         restore = []
-        noop, conflicts = reconcile_v3(att.dispatched, ours, live, snapshot)
+        mine = {s: e for s in att.dispatched if (e := own_entry(att, s, live.get(s))[0])}
+        noop, conflicts = reconcile_v3(att.dispatched, mine, live, snapshot)
         why = ("this attempt's rebuild replaced a composition the index already served, or the "
                "outcome of this attempt's own build is unknown")
+        conflicts = [_replaced(c, live, snapshot) for c in conflicts]
     else:
         restore, noop, conflicts = reconcile(att.dispatched, ours, live, snapshot)
         why = ("somebody published in between, or the outcome of this attempt's own build is "
