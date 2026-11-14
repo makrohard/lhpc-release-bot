@@ -82,7 +82,7 @@ class FakeGitHub(ghmod.GitHub):
         if path.endswith("/logs"):
             jid = int(path.split("/jobs/")[1].split("/")[0])
             if jid not in self.logs:
-                raise ghmod.GitHubError(f"GET {path} -> 404")
+                raise ghmod.GitHubError(f"GET {path} -> 404", status=404)
             return self.logs[jid].encode()
         if "/attempts/" in path:
             n = int(path.split("/attempts/")[1].split("/")[0])
@@ -303,7 +303,7 @@ class ArtifactGitHub(ghmod.GitHub):
         if "/runs/77/attempts/" in path:
             n = int(path.rsplit("/", 1)[1])
             if n not in self.starts:
-                raise ghmod.GitHubError(f"GET {path} -> 404: Not Found")
+                raise ghmod.GitHubError(f"GET {path} -> 404: Not Found", status=404)
             return {"id": 77, "run_attempt": n, "run_started_at": self.starts[n]}
         if path.endswith("/runs/77"):
             # What GitHub reports NOW. Never the answer to "which attempt is judged".

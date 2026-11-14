@@ -18,12 +18,11 @@ from bot import gh
 from bot.gh import GitHub, GitHubError
 
 
-def _http(code, **headers):
+def _http(code, body=b"detail", **headers):
     msg = email.message.Message()
     for k, v in headers.items():
         msg[k.replace("_", "-")] = v
-    return urllib.error.HTTPError("https://api.invalid/x", code, "said", msg,
-                                  io.BytesIO(b"detail"))
+    return urllib.error.HTTPError("https://api.invalid/x", code, "said", msg, io.BytesIO(body))
 
 
 class _Reply:
@@ -144,3 +143,25 @@ def test_ancestry_is_false_only_when_github_does_not_know_the_commits(api):
     api["script"] = [_http(500)] * 4
     with pytest.raises(GitHubError, match="-> 500"):
         GitHub("t").is_ancestor("o/r", "a" * 40, "b" * 40)
+
+
+ARTIFACTS = json.dumps({"artifacts": [{"name": "out", "archive_download_url": "https://x.invalid",
+                                       "created_at": "2026-01-01T00:05:00Z"}]}).encode()
+
+
+@pytest.mark.parametrize("call,before", [
+    (lambda g: g.ref("o/r", "tags/v0.14.0"), []),
+    (lambda g: g.file_at("o/r", "pyproject.toml", "c" * 40), []),
+    (lambda g: g.release_by_tag("o/r", "v0.14.0"), []),
+    (lambda g: g.is_ancestor("o/r", "a" * 40, "b" * 40), []),
+    (lambda g: g.artifact("o/r", 6, "out", 1), [ARTIFACTS])],      # the attempt's start time
+    ids=["ref", "file_at", "release_by_tag", "is_ancestor", "attempt-started"])
+def test_a_server_error_that_mentions_a_404_is_not_a_404(api, call, before):
+    """Each of these reads a 404 as "absent". The error text carries the response body, so a
+    500 whose body says "-> 404" read as absent too: a tag, a file, a release, an ancestry or an
+    attempt that is there would have been reported missing."""
+    api["script"] = before + [_http(500, body=b"upstream comparison -> 404") for _ in range(4)]
+    with pytest.raises(GitHubError) as err:
+        call(GitHub("t"))
+    assert err.value.status == 500
+

@@ -41,9 +41,12 @@ MAX_RETRY_AFTER = 60
 
 
 class GitHubError(RuntimeError):
-    def __init__(self, message: str = "", rate_limited: bool = False):
+    """`status` is the HTTP status (0 when no response came): a 404 is decided by it, never by
+    the message, which carries the response body."""
+
+    def __init__(self, message: str = "", rate_limited: bool = False, status: int = 0):
         super().__init__(message)
-        self.rate_limited = rate_limited
+        self.rate_limited, self.status = rate_limited, status
 
 
 def rate_limited(code: int, headers) -> bool:
@@ -103,7 +106,7 @@ class GitHub:
                 except (OSError, http.client.HTTPException):
                     detail = "(body unreadable)"    # the status still decides the retry
                 limited = rate_limited(exc.code, exc.headers)
-                error = GitHubError(f"{method} {url} -> {exc.code}: {detail}", limited)
+                error = GitHubError(f"{method} {url} -> {exc.code}: {detail}", limited, exc.code)
                 wait = _retry_wait(exc.code, exc.headers, limited, tried)
             except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
                 # The network, a reply cut short (`IncompleteRead`) or one that is not JSON.
@@ -139,7 +142,7 @@ class GitHub:
         try:
             obj = self.get(f"/repos/{repo}/git/ref/{ref}")["object"]
         except GitHubError as exc:
-            if "-> 404" in str(exc):
+            if exc.status == 404:
                 return ""
             raise
         if obj["type"] == "tag":
@@ -152,7 +155,7 @@ class GitHub:
         try:
             got = self.get(f"/repos/{repo}/contents/{path}?ref={ref}")
         except GitHubError as exc:
-            if "-> 404" not in str(exc):
+            if exc.status != 404:
                 raise           # a rate limit is not "the candidate does not ship this file"
             return ""
         if got.get("encoding") != "base64":
@@ -386,7 +389,7 @@ class GitHub:
         try:
             got = self.get(f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}")
         except GitHubError as exc:
-            if "-> 404" in str(exc):
+            if exc.status == 404:
                 return ""
             raise
         return got.get("run_started_at", "")
@@ -527,7 +530,7 @@ class GitHub:
         try:
             return self.get(f"/repos/{repo}/releases/tags/{tag}")
         except GitHubError as exc:
-            if "-> 404" in str(exc):
+            if exc.status == 404:
                 return {}
             raise
 
@@ -538,7 +541,7 @@ class GitHub:
         try:
             got = self.get(f"/repos/{repo}/compare/{ancestor}...{descendant}")
         except GitHubError as exc:
-            if "-> 404" in str(exc):
+            if exc.status == 404:
                 return False    # GitHub does not know one of the two: not contained
             raise               # an outage is not an answer
         return got.get("status") in ("identical", "ahead")
