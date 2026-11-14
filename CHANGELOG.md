@@ -4,6 +4,8 @@ Milestones only.
 
 ## Unreleased
 
+- A run blocked by an unresolved attempt recovers the oldest one itself; one that cannot be settled
+  provably (e.g. an unrecorded publisher) stays open, so the scheduled run stays red until settled.
 - Recovery never settles a publish whose run id was lost (the attempt stays open); a release is
   recorded only when `main` and the tag both name the candidate, whatever the push answered.
 - Recovery withdraws an unproven attempt's own binaries from index-v3.json (installed copies stay);

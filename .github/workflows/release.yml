@@ -89,6 +89,7 @@ jobs:
       branch: ${{ steps.plan.outputs.branch }}
       binary_stacks: ${{ steps.plan.outputs.binary_stacks }}
       binary_stacks_json: ${{ steps.plan.outputs.binary_stacks_json }}
+      blocking: ${{ steps.plan.outputs.blocking }}       # the oldest unresolved attempt, if any
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
         with:
@@ -245,7 +246,9 @@ jobs:
     # Settling the writers and then waiting for the rollback are two bounded waits of their own.
     timeout-minutes: 150
     env:
-      ATTEMPT_RUN_ID: ${{ inputs.attempt }}
+      # An explicit `recover`, else the attempt the plan found blocking: a scheduled run settles
+      # it by itself when that is provable; otherwise it stays open and this run is red.
+      ATTEMPT_RUN_ID: ${{ inputs.attempt || needs.plan.outputs.blocking }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
         with:

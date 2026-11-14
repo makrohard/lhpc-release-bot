@@ -494,6 +494,10 @@ def stage_plan(ctx: Ctx) -> int:
             ctx.out(proceed="false")
             return 0
         if blocking:
+            # Before the Stop: the recover job of THIS run settles the oldest of them
+            # (`inputs.attempt || needs.plan.outputs.blocking`), so a provably settled attempt
+            # does not wait for somebody to dispatch `recover` by hand.
+            ctx.out(blocking=min(blocking, key=lambda na: na[0])[1].run_id)
             lines = [f"- issue #{n}: attempt {a.run_id}, state `{a.state}`"
                      + (f", still owes {', '.join(a.owes)}" if a.owes else "")
                      for n, a in blocking]

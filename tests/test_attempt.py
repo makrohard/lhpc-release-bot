@@ -427,3 +427,36 @@ def test_a_record_built_from_a_full_history_index_stays_small(tmp_path, monkeypa
     with pytest.raises(cli.Stop):
         cli.stage_build(ctx)
     assert len(ctx.att.to_body()) < 10_000
+
+
+# ---- P9: a run blocked by an unresolved attempt settles the oldest of them by itself ----
+
+def test_a_plan_blocked_by_open_attempts_names_the_oldest_before_it_stops(tmp_path, monkeypatch):
+    """The recover job of the same run takes the id the plan wrote; it must be written BEFORE the
+    Stop (a job's outputs are what its steps wrote), and it must be the oldest attempt."""
+    from bot import cli
+    from tests.test_pins_check import _plan_ctx
+    _, ctx = _plan_ctx(tmp_path, monkeypatch)
+    newer = Attempt(run_id="300", state="mutated", version="0.12.11")
+    older = Attempt(run_id="200", state="mutated", version="0.12.11")
+    ctx.open_attempts = lambda: [(9, newer), (5, older)]
+    with pytest.raises(cli.Stop, match="an earlier attempt is unresolved"):
+        cli.stage_plan(ctx)
+    assert ctx.outs == [{"blocking": "200"}]
+
+
+def test_the_recover_job_takes_the_blocking_attempt_when_none_was_given():
+    import re
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+            / "release.yml").read_text()
+    jobs = dict(re.findall(r"^  ([a-z][a-z-]*):\n(.*?)(?=^  [a-z][a-z-]*:\n|\Z)", text,
+                           re.S | re.M))
+    out = re.escape("blocking: ${{ steps.plan.outputs.blocking }}")
+    env = re.escape("ATTEMPT_RUN_ID: ${{ inputs.attempt || needs.plan.outputs.blocking }}")
+    run = re.escape('- run: python -m bot.cli recover --attempt "${ATTEMPT_RUN_ID}"')
+    assert re.search(rf"(?m)^      {out}", jobs["plan"])
+    recover = jobs["recover"]
+    assert re.search(r"(?m)^    needs: \[plan\b", recover)
+    assert re.search(rf"(?m)^      {env}$", recover)
+    assert re.search(rf"(?m)^      {run}$", recover)
