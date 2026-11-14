@@ -387,6 +387,65 @@ def _prove(*, ordinary="success"):
     return ctx.att
 
 
+class _GreenLaneCtx(_ProveCtx):
+    """Every release case passed."""
+
+    def artifact_member(self, repo, run_id, name, member, attempt=1):
+        return ("<testsuite>" + "".join(f'<testcase name="{c}"></testcase>' for c in REQUIRED_CASES)
+                + "</testsuite>").encode()
+
+
+def _ci_red_lane_green():
+    from bot import cli
+    ci = [{"name": n, "conclusion": "failure" if n == "test (3.12)" else "success",
+           "head_sha": CAND} for n in cli.REQUIRED_CI]
+    lane = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in cli.REQUIRED_TESTLAB]
+    return _GreenLaneCtx(jobs_by_run={5: ci, 6: lane})
+
+
+def test_prove_and_recovery_ask_one_verdict_ci_red_lane_green():
+    """`prove_verdict` is the one judgement `stage_prove` and recovery share. CI red with the lane
+    green is not proven, names no stack, and the stage stops on exactly the same problems."""
+    from bot import cli
+    ctx = _ci_red_lane_green()
+    ctx.att.runs["testlab"] = ctx.record_run("o/r", 6)
+    problems, lane_only, _ = cli.prove_verdict(ctx, ctx.att, 7)
+    assert problems and not lane_only
+    assert problems == ["test (3.12): failure", "ci: failure"]
+
+    staged = _ci_red_lane_green()
+    with pytest.raises(cli.Stop) as stop:
+        cli.stage_prove(staged)
+    assert stop.value.observed == "the candidate is not proven:\n\n" + "\n".join(
+        f"- {p}" for p in problems)
+    assert staged.att.regression == []
+
+
+def test_a_record_without_a_lane_run_is_not_proven_and_does_not_crash():
+    """Recovery asks about attempts whose prove stage never ran."""
+    from bot import cli
+    ctx = _ci_red_lane_green()
+    problems, lane_only, junit = cli.prove_verdict(ctx, ctx.att, 7)
+    assert "testlab: this attempt never recorded a run" in problems
+    assert "the release lane produced no JUnit — its cases cannot be confirmed" in problems
+    assert junit is None and not lane_only
+
+
+def test_a_red_ci_run_keeps_the_lane_from_naming_a_stack_even_with_its_required_jobs_green():
+    """The CI run concluded failure on a job outside REQUIRED_CI. That is CI's answer, not the
+    lane's: it may never accompany an attribution."""
+    from bot import cli
+    ci = [{"name": n, "conclusion": "success", "head_sha": CAND} for n in cli.REQUIRED_CI]
+    ci.append({"name": "docs", "conclusion": "failure", "head_sha": CAND})
+    lane = [{"name": "testlab", "conclusion": "success", "head_sha": CAND},
+            {"name": "slow-build", "conclusion": "success", "head_sha": CAND},
+            {"name": cli.LANE_JOB, "conclusion": "failure", "head_sha": CAND}]
+    ctx = _ProveCtx(jobs_by_run={5: ci, 6: lane})
+    with pytest.raises(cli.Stop):
+        cli.stage_prove(ctx)
+    assert ctx.att.regression == []
+
+
 def test_a_lane_regression_alone_names_the_stack_it_blamed():
     """The control. Without it the next case would pass for the wrong reason."""
     assert _prove(ordinary="success").regression == ["kiss"]

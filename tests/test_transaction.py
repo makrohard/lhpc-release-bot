@@ -251,8 +251,8 @@ def v3entry(sha="a", pin="b", inputs="f", published="2026-10-16T08:00:00Z"):
 
 
 def core(e):
-    """The entry as the build's fragment states it: the publisher adds the other two fields."""
-    return {k: v for k, v in e.items() if k not in ("inputs", "published_at")}
+    """The entry as the build's fragment states it: the publisher adds the other fields."""
+    return {k: v for k, v in e.items() if k not in ("inputs", "published_at", "build_run")}
 
 
 def test_v3_our_build_must_be_the_newest_of_its_stack():
@@ -269,6 +269,17 @@ def test_v3_an_entry_that_differs_in_provenance_is_not_ours():
     mine = v3entry("6")
     twin = dict(mine, lhpc_commit="7" * 40)
     assert not published_first({"meshtastic": [twin]}, "meshtastic", core(mine))
+
+
+def test_v3_the_publishers_run_field_is_not_part_of_what_the_fragment_states():
+    """The publisher writes `build_run` (lhpc-binaries S1) beside `inputs` and `published_at`. Our
+    own entry carrying it is still ours: the build stage must not read it as somebody else's
+    publish, and recovery must not call it a conflict."""
+    from bot.cli import published_first, reconcile_v3
+    mine, old = dict(v3entry("6", pin="2"), build_run="777.1"), v3entry("8")
+    assert published_first({"meshtastic": [mine, old]}, "meshtastic", core(mine))
+    assert reconcile_v3(["meshtastic"], {"meshtastic": core(mine)}, {"meshtastic": [mine, old]},
+                        {"meshtastic": [old]}) == (["meshtastic"], [])
 
 
 def test_v3_recover_leaves_a_new_composition_where_it_is():

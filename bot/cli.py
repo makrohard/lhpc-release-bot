@@ -1159,10 +1159,11 @@ def entry_key(e) -> list:
 
 
 def _same_build(a: dict, b: dict) -> bool:
-    """The same published artifact, compared on everything the fragment states. `inputs` and
-    `published_at` are the publisher's own fields in index-v3.json; the fragment has neither."""
+    """The same published artifact, compared on everything the fragment states. `inputs`,
+    `published_at` and `build_run` are the publisher's own fields in index-v3.json; the fragment
+    has none of them."""
     def core(e):
-        return {k: v for k, v in e.items() if k not in ("inputs", "published_at")}
+        return {k: v for k, v in e.items() if k not in ("inputs", "published_at", "build_run")}
     return _canon(core(a)) == _canon(core(b))
 
 
@@ -1323,22 +1324,11 @@ def _live_index(ctx: Ctx, name: str) -> dict:
 # ---------------------------------------------------------------------------- stage: prove
 
 
-def stage_prove(ctx: Ctx) -> int:
-    """Every required job succeeded ON THIS CANDIDATE, and the release lane actually ran its
-    cases.
-
-    A job name and a green tick are not proof: the branch is mutable, a run can be re-run, and
-    a lane can report success having skipped everything. So each result is bound to the run
-    this attempt started, to that run's attempt number, and to the candidate commit — and the
-    lane's own JUnit is read for the cases it must have run.
-    """
-    number, att = ctx.find_attempt(ctx.attempt_id)
-    if not att:
-        raise Stop("prove", "this run has no attempt record.", "Re-run from the start.")
-    testlab = ctx.gh.dispatch(LHPC, TESTLAB_WORKFLOW, att.branch, {"release_verify": "true"})
-    att.runs["testlab"] = ctx.record_run(LHPC, testlab)
-    ctx.save_attempt(number, att)
-
+def prove_verdict(ctx: Ctx, att: Attempt, number: int) -> tuple:
+    """`(problems, lane_only, junit)`: THE judgement of this attempt's recorded CI and testlab runs
+    (identity, off-lane, outcome, the release lane's JUnit cases). `stage_prove` and recovery
+    both ask it, so "proven" means one thing. `lane_only`: the lane's own cases were red and
+    nothing questions the runs' identity, the only shape that may name a stack."""
     identity, outcome = [], []
     for name, required, bound in (("ci", REQUIRED_CI, BOUNDS["ci"]),
                                   ("testlab", REQUIRED_TESTLAB, BOUNDS["testlab"])):
@@ -1375,9 +1365,9 @@ def stage_prove(ctx: Ctx) -> int:
         (outcome if name == "testlab" else identity).extend(got_outcome)
     problems = identity + outcome
 
-    junit = ctx.gh.artifact_member(LHPC, int(att.runs["testlab"]["id"]),
-                                   "testlab-logs-release-verify", "junit-release.xml",
-                                   att.runs["testlab"].get("attempt", 1))
+    lab = att.runs.get("testlab")
+    junit = ctx.gh.artifact_member(LHPC, int(lab["id"]), "testlab-logs-release-verify",
+                                   "junit-release.xml", lab.get("attempt", 1)) if lab else None
     unreadable, red = _release_case_problems(
         junit, required_release_cases(
             ctx.gh.file_at(LHPC, RELEASE_CASES_PATH, att.candidate_sha)))
@@ -1388,6 +1378,26 @@ def stage_prove(ctx: Ctx) -> int:
     # is non-empty only when the evidence was readable.
     lane_only = bool(red) and not identity
     problems += unreadable + red
+    return problems, lane_only, junit
+
+
+def stage_prove(ctx: Ctx) -> int:
+    """Every required job succeeded ON THIS CANDIDATE, and the release lane actually ran its
+    cases.
+
+    A job name and a green tick are not proof: the branch is mutable, a run can be re-run, and
+    a lane can report success having skipped everything. So each result is bound to the run
+    this attempt started, to that run's attempt number, and to the candidate commit — and the
+    lane's own JUnit is read for the cases it must have run.
+    """
+    number, att = ctx.find_attempt(ctx.attempt_id)
+    if not att:
+        raise Stop("prove", "this run has no attempt record.", "Re-run from the start.")
+    testlab = ctx.gh.dispatch(LHPC, TESTLAB_WORKFLOW, att.branch, {"release_verify": "true"})
+    att.runs["testlab"] = ctx.record_run(LHPC, testlab)
+    ctx.save_attempt(number, att)
+
+    problems, lane_only, junit = prove_verdict(ctx, att, number)
 
     if problems:
         # Record WHO the lane blamed, before stopping. Acting on it here would be wrong: the
