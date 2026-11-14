@@ -651,6 +651,19 @@ def test_an_unproven_rebuild_that_replaced_a_proven_entry_is_withdrawn_and_names
     assert ctx.att.state == "mutated"
 
 
+def test_a_snapshot_entry_replaced_by_the_same_file_of_another_run_is_named():
+    """E0 was replaced in its composition by the SAME file published by another run (its
+    `build_run`, so its key, differs). The file is still live, but E0 is not; the Stop names it."""
+    from bot import cli
+    e0, e1 = _own(run="555.1"), _own(run="888.1")
+    ctx = _RecoverCtx(fragment=core(e1), live=[e1], snapshot=[e0], ci="success")
+    with pytest.raises(cli.Stop) as stop:
+        _recover(ctx)
+    assert f"{e0['filename']} (sha256 {e0['sha256']}) is no longer in the index" \
+        in stop.value.observed
+    assert ctx.dispatches == []
+
+
 def test_a_recovery_after_an_interrupted_withdrawal_waits_for_it_and_does_not_withdraw_again():
     """The last recover stopped while its withdraw run was going; the run finished and removed
     the entry. This one settles that run first, then finds nothing of ours left."""

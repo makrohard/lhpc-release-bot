@@ -2110,8 +2110,8 @@ def stage_finalize(ctx: Ctx) -> int:
 
 def _replaced(stack: str, live: dict, snapshot: dict) -> str:
     """A v3 conflict line: the stack, and each snapshot entry no longer in the index, by its key."""
-    now = [entry_key(e)[:2] for e in live.get(stack) or []]
-    gone = [k for k in (entry_key(e) for e in snapshot.get(stack) or []) if k[:2] not in now]
+    now = [entry_key(e) for e in live.get(stack) or []]
+    gone = [k for k in (entry_key(e) for e in snapshot.get(stack) or []) if k not in now]
     return stack + "".join(f"; the snapshot's {k[0]} (sha256 {k[1]}) is no longer in the index"
                            for k in gone)
 
