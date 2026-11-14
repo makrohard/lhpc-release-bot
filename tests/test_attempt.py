@@ -299,7 +299,9 @@ def test_an_unreachable_source_beside_a_move_is_reported_and_the_plan_goes_on(tm
 
 # ---- one failed read after a dispatch never loses the run it started ----
 
-def test_a_failed_read_after_a_dispatch_keeps_the_run_and_its_identity(tmp_path, monkeypatch):
+@pytest.mark.parametrize("body", ["readable", "cut-short"])
+def test_a_failed_read_after_a_dispatch_keeps_the_run_and_its_identity(tmp_path, monkeypatch,
+                                                                       body):
     """Attempt #73's loss: GitHub answered 500 to the first read of a build it had just started,
     the id in the dispatch reply was dropped, and nothing could settle that writer afterwards.
     The id is recorded at once; workflow, attempt and commit come from the run the wait returns,
@@ -316,7 +318,28 @@ def test_a_failed_read_after_a_dispatch_keeps_the_run_and_its_identity(tmp_path,
             return super().save_attempt(number, att)
 
     def blip(repo, run_id):
-        raise GitHubError(f"GET /repos/{repo}/actions/runs/{run_id} -> 500: Server Error")
+        if body == "readable":
+            raise GitHubError(f"GET /repos/{repo}/actions/runs/{run_id} -> 500: Server Error")
+        return transport.run(repo, run_id)       # the real client: a 500 whose body is cut
+
+    import email.message
+    import http.client
+    import io
+    import urllib.error
+
+    from bot import gh
+    from bot.gh import GitHub
+
+    class _CutBody(io.BytesIO):
+        def read(self, *a):
+            raise http.client.IncompleteRead(b"<ht")
+
+    def cut_500(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 500, "said", email.message.Message(),
+                                     _CutBody())
+    transport = GitHub("t")
+    monkeypatch.setattr(gh.urllib.request, "urlopen", cut_500)    # the fake: no network
+    monkeypatch.setattr(gh.time, "sleep", lambda s: None)
 
     monkeypatch.setenv("BINARY_STACK", "meshtastic")
     monkeypatch.setattr(cli, "MANIFEST", "m.toml")

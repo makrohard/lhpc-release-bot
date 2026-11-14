@@ -74,6 +74,20 @@ def test_a_get_that_failed_on_something_passing_is_tried_again(api, failure, sle
     assert api["calls"] == ["GET", "GET"] and api["slept"] == [slept]
 
 
+class _CutBody(io.BytesIO):
+    def read(self, *a):
+        raise http.client.IncompleteRead(b"<ht")
+
+
+def test_an_error_whose_body_is_cut_short_is_still_a_retried_github_error(api):
+    """The status line arrived, the body did not: the status alone decides."""
+    cut = urllib.error.HTTPError("https://api.invalid/x", 500, "said", email.message.Message(),
+                                 _CutBody())
+    api["script"] = [cut, OK]
+    assert GitHub("t").get("/repos/o/r/x") == {"status": "ahead"}
+    assert api["calls"] == ["GET", "GET"] and api["slept"] == [5]
+
+
 def test_a_get_that_keeps_failing_is_tried_four_times_then_raises(api):
     api["script"] = [_http(503)] * 4
     with pytest.raises(GitHubError, match="-> 503"):

@@ -98,7 +98,10 @@ class GitHub:
                     raw = r.read()
                     return json.loads(raw) if raw and accept.endswith("json") else raw
             except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", "replace")[:400]
+                try:
+                    detail = exc.read().decode("utf-8", "replace")[:400]
+                except (OSError, http.client.HTTPException):
+                    detail = "(body unreadable)"    # the status still decides the retry
                 limited = rate_limited(exc.code, exc.headers)
                 error = GitHubError(f"{method} {url} -> {exc.code}: {detail}", limited)
                 wait = _retry_wait(exc.code, exc.headers, limited, tried)
