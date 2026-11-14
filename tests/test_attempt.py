@@ -368,6 +368,32 @@ def test_a_failed_read_after_a_dispatch_keeps_the_run_and_its_identity(tmp_path,
     assert ctx.att.regression == ["meshtastic"]
 
 
+def test_the_build_stage_run_twice_dispatches_one_build(tmp_path, monkeypatch):
+    """A re-run of the build job on the same record waits on the build it recorded; a second
+    dispatch would start a second writer of the same stack that recovery cannot tell apart."""
+    from bot import cli
+    from tests.test_autofreeze import BUILD_POLICY, _BuildCtx
+
+    monkeypatch.setenv("BINARY_STACK", "meshtastic")
+    monkeypatch.setattr(cli, "MANIFEST", "m.toml")
+    monkeypatch.setattr(cli.up, "load_policy", lambda p: BUILD_POLICY)
+    monkeypatch.setattr(cli, "git", lambda *a, **k: "")
+    ctx = _BuildCtx(tmp_path, b"")
+    waited, wait = [], ctx.gh.wait
+
+    def counted(repo, run_id, bound):
+        waited.append(run_id)
+        return wait(repo, run_id, bound)
+
+    ctx.gh.wait = counted
+    for _ in range(2):
+        with pytest.raises(cli.Stop, match="did not succeed"):
+            cli.stage_build(ctx)
+    assert len(ctx.gh.dispatched) == 1
+    assert waited == [777, 777]
+    assert ctx.att.runs["binary:meshtastic"]["id"] == 777 and ctx.att.dispatched == ["meshtastic"]
+
+
 def test_a_record_built_from_a_full_history_index_stays_small(tmp_path, monkeypatch):
     """The record lives in an issue body, which GitHub caps at 65,536 characters. With the whole
     index-v3 history inside it, it grew 18,070 -> 33,669 characters over four attempts."""

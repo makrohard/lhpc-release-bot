@@ -1012,11 +1012,14 @@ def stage_build(ctx: Ctx) -> int:
     att.state = "mutated"
     ctx.save_attempt(number, att)
 
-    run_id = ctx.gh.dispatch(BIN, BUILD_WORKFLOW, "main",
-                             {"stack": stack, "source_commit": "",
-                              "lhpc_ref": att.candidate_sha, "smoke_test": "true"})
-    att.runs[f"binary:{stack}"] = ctx.record_run(BIN, run_id)
-    ctx.save_attempt(number, att)
+    if f"binary:{stack}" not in att.runs:
+        # One publish per stack per attempt: a re-run of this stage waits on the recorded run
+        # instead of starting a second writer, which recovery could not tell from the first.
+        att.runs[f"binary:{stack}"] = ctx.record_run(BIN, ctx.gh.dispatch(
+            BIN, BUILD_WORKFLOW, "main", {"stack": stack, "source_commit": "",
+                                          "lhpc_ref": att.candidate_sha, "smoke_test": "true"}))
+        ctx.save_attempt(number, att)
+    run_id = int(att.runs[f"binary:{stack}"]["id"])
     run = _wait(ctx, att.runs[f"binary:{stack}"], BOUNDS["binary"], att, number)
 
     entry = _candidate_entry(ctx, att.runs[f"binary:{stack}"], stack, att.candidate_sha)

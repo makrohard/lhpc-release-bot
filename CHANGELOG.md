@@ -4,6 +4,8 @@ Milestones only.
 
 ## Unreleased
 
+- A re-run of the build stage waits on the build it recorded instead of dispatching a second
+  publisher of the same stack.
 - A scheduled run pushes one empty "heartbeat" commit when this repository's main has had no
   commit for 28 days, so GitHub never switches the weekly schedule off.
 - The attempt record keeps the index-v3 snapshot as one short key per entry, so it stays far
