@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -997,7 +998,13 @@ def stage_build(ctx: Ctx) -> int:
                    "A rehearsal never publishes a binary. Nothing was dispatched.")
 
     if not att.index_snapshot:
-        att.index_snapshot = _live_index(ctx, att.binary_index)
+        live = _live_index(ctx, att.binary_index)
+        if att.binary_index == "index-v3.json":
+            # Kept as keys: the whole history in the issue body grew towards GitHub's 65,536-
+            # character cap. Recovery compares keys; there is no v3 rollback that needs entries.
+            live = dict(live, stacks={s: [entry_key(e) for e in h]
+                                      for s, h in (live.get("stacks") or {}).items()})
+        att.index_snapshot = live
     # Recorded BEFORE the dispatch: a dispatch whose reply is lost has still started a writer,
     # and recovery must know a publish may exist for this stack.
     if stack not in att.dispatched:
@@ -1139,6 +1146,18 @@ def composition(e: dict) -> tuple:
             sorted((e.get("inputs") or {}).items()))
 
 
+def entry_key(e) -> list:
+    """An index-v3 entry as `[filename, sha256, fp, comp]`: `fp` stands for the whole entry and
+    `comp` for its composition (each the first 16 hex of a sha256). A key is returned as it is,
+    so a record holding full entries (written before keys) and one holding keys compare alike."""
+    if isinstance(e, list):
+        return e
+
+    def digest(value) -> str:
+        return hashlib.sha256(_canon(value).encode()).hexdigest()[:16]
+    return [e.get("filename"), e.get("sha256"), digest(e), digest(composition(e))]
+
+
 def _same_build(a: dict, b: dict) -> bool:
     """The same published artifact, compared on everything the fragment states. `inputs` and
     `published_at` are the publisher's own fields in index-v3.json; the fragment has neither."""
@@ -1177,9 +1196,10 @@ def reconcile_v3(dispatched, ours: dict, live: dict, snapshot: dict) -> tuple:
         mine, history = ours.get(stack), live.get(stack) or []
         before = snapshot.get(stack) or []
         found = _ours_in(history, mine) if mine else None
+        keys = [entry_key(e) for e in history]
         if found is None:
-            (noop if _canon(history) == _canon(before) else conflicts).append(stack)
-        elif _same_build(found, mine) and not any(composition(e) == composition(found)
+            (noop if keys == [entry_key(e) for e in before] else conflicts).append(stack)
+        elif _same_build(found, mine) and not any(entry_key(e)[3] == entry_key(found)[3]
                                                     for e in before):
             noop.append(stack)
         else:

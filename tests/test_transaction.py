@@ -402,3 +402,37 @@ def test_the_required_evidence_is_what_the_publisher_actually_writes():
         "components-lite.txt", "components-desktop.txt",
         "packages-lite.txt", "packages-desktop.txt",
         "SHA256SUMS", "signature.txt", "AUTO-RELEASE"}
+
+
+# ------------------------------------- the snapshot kept as keys (the record must stay small)
+
+def test_a_key_stands_for_the_whole_entry_and_its_composition():
+    from bot.cli import entry_key
+    e = v3entry("6")
+    assert entry_key(e) == entry_key(entry_key(e))           # a stored key reads as itself
+    assert entry_key(e)[:2] == [e["filename"], e["sha256"]]
+    twin = dict(e, lhpc_commit="7" * 40)                     # same file and digest, other provenance
+    assert entry_key(twin)[2] != entry_key(e)[2] and entry_key(twin)[3] == entry_key(e)[3]
+    rebuilt = v3entry("6", inputs="9")                       # other inputs: another composition
+    assert entry_key(rebuilt)[3] != entry_key(e)[3]
+
+
+@pytest.mark.parametrize("ours,live,before,want", [
+    ({"meshtastic": core(v3entry("6", pin="2"))}, [v3entry("6", pin="2"), v3entry("8")],
+     [v3entry("8")], (["meshtastic"], [])),
+    ({"meshtastic": core(v3entry("6", published="2026-10-16T09:00:00Z"))},
+     [v3entry("6", published="2026-10-16T09:00:00Z")], [v3entry("8")], ([], ["meshtastic"])),
+    ({}, [v3entry("f", pin="9"), v3entry("8")], [v3entry("8")], ([], ["meshtastic"])),
+    ({}, [v3entry("8")], [v3entry("8")], (["meshtastic"], [])),
+    ({}, [dict(v3entry("8"), lhpc_commit="7" * 40)], [v3entry("8")], ([], ["meshtastic"]))],
+    ids=["new-composition", "replaced-composition", "unknown-outcome", "nothing-published",
+         "entry-changed-in-place"])
+def test_v3_a_snapshot_of_keys_gives_the_verdicts_of_a_snapshot_of_entries(ours, live, before,
+                                                                           want):
+    """Records written before keys hold whole entries and must still read; new ones hold keys.
+    Both give the same verdict for every case recovery tells apart."""
+    from bot.cli import entry_key, reconcile_v3
+    full = reconcile_v3(["meshtastic"], ours, {"meshtastic": live}, {"meshtastic": before})
+    keys = reconcile_v3(["meshtastic"], ours, {"meshtastic": live},
+                        {"meshtastic": [entry_key(e) for e in before]})
+    assert full == keys == want
