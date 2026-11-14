@@ -11,6 +11,7 @@ Nothing here decides anything. Every refusal lives in the caller.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import json
 import time
 import urllib.error
@@ -32,8 +33,40 @@ EXTERNAL_WAITS = (0, 60, 120, 300, 600)
 MAX_RERUNS = 5
 
 
+# A GET that failed on something passing (a 5xx, a rate limit, the network, a cut or garbled
+# reply) is tried again after these waits; POST/PATCH/DELETE never are, because a lost reply may
+# hide a write that happened. A `Retry-After` up to the cap is waited instead; a longer one raises.
+GET_RETRY_WAITS = (5, 15, 45)
+MAX_RETRY_AFTER = 60
+
+
 class GitHubError(RuntimeError):
-    pass
+    def __init__(self, message: str = "", rate_limited: bool = False):
+        super().__init__(message)
+        self.rate_limited = rate_limited
+
+
+def rate_limited(code: int, headers) -> bool:
+    """The one answer to "is this a rate limit?": a 429, or a 403 that says so in its headers.
+    Any other 403 is a permission the token does not have, and waiting will not give it one."""
+    if code == 429:
+        return True
+    return code == 403 and headers is not None and (
+        headers.get("x-ratelimit-remaining") == "0" or headers.get("retry-after") is not None)
+
+
+def _retry_wait(code: int, headers, limited: bool, tried: int):
+    """Seconds to wait before trying a failed GET again, or None: do not."""
+    if not (code >= 500 or limited) or tried >= len(GET_RETRY_WAITS):
+        return None
+    after = headers.get("retry-after") if headers is not None else None
+    if after is None:
+        return GET_RETRY_WAITS[tried]
+    try:
+        seconds = int(after)
+    except ValueError:
+        return None
+    return seconds if 0 <= seconds <= MAX_RETRY_AFTER else None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -54,19 +87,29 @@ class GitHub:
     def request(self, method: str, path: str, body=None, accept="application/vnd.github+json"):
         url = path if path.startswith("http") else f"{self._api}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method, headers={
-            "Authorization": f"Bearer {self._token}", "Accept": accept,
-            "X-GitHub-Api-Version": API_VERSION, "User-Agent": "lhpc-release-bot",
-            **({"Content-Type": "application/json"} if data else {})})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                raw = r.read()
-                return json.loads(raw) if raw and accept.endswith("json") else raw
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:400]
-            raise GitHubError(f"{method} {url} -> {exc.code}: {detail}") from None
-        except (urllib.error.URLError, OSError) as exc:
-            raise GitHubError(f"{method} {url} -> {exc}") from None
+        tried = 0
+        while True:
+            req = urllib.request.Request(url, data=data, method=method, headers={
+                "Authorization": f"Bearer {self._token}", "Accept": accept,
+                "X-GitHub-Api-Version": API_VERSION, "User-Agent": "lhpc-release-bot",
+                **({"Content-Type": "application/json"} if data else {})})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    raw = r.read()
+                    return json.loads(raw) if raw and accept.endswith("json") else raw
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:400]
+                limited = rate_limited(exc.code, exc.headers)
+                error = GitHubError(f"{method} {url} -> {exc.code}: {detail}", limited)
+                wait = _retry_wait(exc.code, exc.headers, limited, tried)
+            except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+                # The network, a reply cut short (`IncompleteRead`) or one that is not JSON.
+                error = GitHubError(f"{method} {url} -> {exc}")
+                wait = GET_RETRY_WAITS[tried] if tried < len(GET_RETRY_WAITS) else None
+            if method != "GET" or wait is None:
+                raise error
+            time.sleep(wait)
+            tried += 1
 
     def get(self, path):
         return self.request("GET", path)
@@ -491,8 +534,10 @@ class GitHub:
             return True
         try:
             got = self.get(f"/repos/{repo}/compare/{ancestor}...{descendant}")
-        except GitHubError:
-            return False
+        except GitHubError as exc:
+            if "-> 404" in str(exc):
+                return False    # GitHub does not know one of the two: not contained
+            raise               # an outage is not an answer
         return got.get("status") in ("identical", "ahead")
 
     def pull_request(self, repo: str, head: str, base: str, title: str, body: str) -> dict:

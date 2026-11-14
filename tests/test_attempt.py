@@ -295,3 +295,49 @@ def test_an_unreachable_source_beside_a_move_is_reported_and_the_plan_goes_on(tm
         cli.stage_plan(ctx)
     assert any("Not reachable this run" in s and "`src/a`" in s for s in ctx.summaries)
     assert ctx.degraded == [("source", ["src/a"], ["src/a", "src/b"])]
+
+
+# ---- one failed read after a dispatch never loses the run it started ----
+
+def test_a_failed_read_after_a_dispatch_keeps_the_run_and_its_identity(tmp_path, monkeypatch):
+    """Attempt #73's loss: GitHub answered 500 to the first read of a build it had just started,
+    the id in the dispatch reply was dropped, and nothing could settle that writer afterwards.
+    The id is recorded at once; workflow, attempt and commit come from the run the wait returns,
+    and are saved before the evidence is judged, so the builder's marker still attributes."""
+    from bot import cli
+    from bot.gh import GitHubError
+    from tests.test_autofreeze import BUILD_POLICY, _BuildCtx, _evidence
+
+    class Ctx(_BuildCtx):
+        record_run = cli.Ctx.record_run         # the real one
+
+        def save_attempt(self, number, att):
+            self.records.append({k: dict(v) for k, v in att.runs.items()})
+            return super().save_attempt(number, att)
+
+    def blip(repo, run_id):
+        raise GitHubError(f"GET /repos/{repo}/actions/runs/{run_id} -> 500: Server Error")
+
+    monkeypatch.setenv("BINARY_STACK", "meshtastic")
+    monkeypatch.setattr(cli, "MANIFEST", "m.toml")
+    monkeypatch.setattr(cli.up, "load_policy", lambda p: BUILD_POLICY)
+    monkeypatch.setattr(cli, "git", lambda *a, **k: "")
+    key, judged = "binary:meshtastic", []
+    real_entry = cli._candidate_entry
+
+    def entry(c, rec, stack, candidate):        # the first evidence read after the wait
+        judged.append(ctx.records[-1][key])
+        return real_entry(c, rec, stack, candidate)
+
+    monkeypatch.setattr(cli, "_candidate_entry", entry)
+    ctx = Ctx(tmp_path, _evidence(run="777"))
+    ctx.records = []
+    ctx.gh.run = blip
+    with pytest.raises(cli.Stop):
+        cli.stage_build(ctx)
+    first = next(r[key] for r in ctx.records if key in r)
+    assert first == {"repo": cli.BIN, "id": 777}                 # saved before the wait
+    assert judged == [{"repo": cli.BIN, "id": 777, "workflow": 9, "attempt": 1,
+                       "sha": "c" * 40}]                         # saved before it is judged
+    cli._auto_freeze(ctx, 5, ctx.att)
+    assert ctx.att.regression == ["meshtastic"]

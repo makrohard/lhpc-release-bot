@@ -176,10 +176,20 @@ class Ctx:
     def record_run(self, repo: str, run_id: int) -> dict:
         """Everything needed later to prove WHICH execution produced a result: a run id alone
         is not enough, because a re-run keeps the id and the jobs endpoint answers for the
-        latest attempt."""
-        run = self.gh.run(repo, run_id)
-        return {"repo": repo, "id": int(run_id), "workflow": run.get("workflow_id"),
-                "attempt": run.get("run_attempt", 1), "sha": run.get("head_sha", "")}
+        latest attempt.
+
+        The id comes from the dispatch reply and is kept even when the follow-up read fails: a
+        run nobody recorded is a writer nothing can settle. `_wait` then fills the rest from
+        the run it waited for."""
+        rec = {"repo": repo, "id": int(run_id)}
+        try:
+            run = self.gh.run(repo, run_id)
+        except GitHubError as exc:
+            self.summary(f"\n{repo} run {run_id}: started, but it could not be read yet "
+                         f"({exc}); its workflow, attempt and commit are taken when it is waited for")
+            return rec
+        return dict(rec, workflow=run.get("workflow_id"), attempt=run.get("run_attempt", 1),
+                    sha=run.get("head_sha", ""))
 
     def out(self, **kv) -> None:
         path = os.environ.get("GITHUB_OUTPUT")
@@ -262,6 +272,11 @@ def _wait(ctx, rec: dict, bound: float, att: Attempt | None = None, number: int 
     run = (ctx.gh.wait(rec["repo"], int(rec["id"]), bound,
                        external=lambda r: _external_jobs(ctx, rec, r))
            if external else ctx.gh.wait(rec["repo"], int(rec["id"]), bound))
+    filled = "workflow" not in rec and "workflow_id" in run
+    if filled:
+        # `record_run` could not read the run after its dispatch. A dispatched run starts as
+        # attempt 1; a later attempt counts only when this wait asked for it (below).
+        rec.update(workflow=run.get("workflow_id"), attempt=1, sha=run.get("head_sha", ""))
     if run.get("rerun"):
         # The attempt THIS bot asked for, not whatever GitHub reports now: a third attempt
         # somebody else started is not the one judged, and the identity check must say so.
@@ -279,10 +294,13 @@ def _wait(ctx, rec: dict, bound: float, att: Attempt | None = None, number: int 
         note = (f"{rec['repo']} run {rec['id']} lost its runner, but the re-run was refused: "
                 f"{run['rerun_error']}")
     else:
-        return run
-    ctx.summary(f"\n{note}")
-    if att is not None:
-        att.notes.append(note)
+        note = ""
+    if note:
+        ctx.summary(f"\n{note}")
+    if att is not None and (note or filled):
+        # Saved before any evidence is judged: a later job reads the identity from the record.
+        if note:
+            att.notes.append(note)
         ctx.save_attempt(number, att)
     return run
 

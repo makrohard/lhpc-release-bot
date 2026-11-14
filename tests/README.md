@@ -38,6 +38,8 @@ By the decision it protects:
   published image really is this release's.
 - **`test_proof.py`** — what counts as proof that THIS candidate is green, and how much
   credential a publishing run must have left.
+- **`test_gh.py`** — which failed API call is tried again (a read on something passing), and
+  which is not (a write, a refusal, a long `Retry-After`).
 - **`test_report.py`** — what a failure issue says: who stopped, and the inputs it was moving.
 - **`test_integration_branch.py`** — the one conflict resolved automatically, against real git
   history with a real conflict.

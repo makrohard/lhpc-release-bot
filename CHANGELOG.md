@@ -4,6 +4,8 @@ Milestones only.
 
 ## Unreleased
 
+- One GitHub blip no longer strands an attempt: a run id is kept from its dispatch reply, and a
+  failed read is tried again (4 tries; never a write).
 - Binaries go into the index the candidate's manifest names: `index.json`, or the history
   `index-v3.json`. A web-client move republishes only an artifact that still records it; a dry
   run shows which.
