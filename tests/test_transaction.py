@@ -282,6 +282,33 @@ def test_v3_the_publishers_run_field_is_not_part_of_what_the_fragment_states():
                         {"meshtastic": [old]}) == (["meshtastic"], [])
 
 
+def test_v3_the_build_stage_takes_its_own_entry_with_build_run_as_published(tmp_path, monkeypatch):
+    """The same through the public path: a green v3 build whose live entry carries the
+    publisher's `build_run` is this attempt's publish, not somebody else's (second read)."""
+    import json
+
+    from bot import cli
+    from tests.test_autofreeze import BUILD_POLICY, _BuildCtx
+    monkeypatch.setenv("BINARY_STACK", "meshtastic")
+    monkeypatch.setattr(cli, "MANIFEST", "m.toml")
+    monkeypatch.setattr(cli.up, "load_policy", lambda p: BUILD_POLICY)
+    monkeypatch.setattr(cli, "git", lambda *a, **k: "")
+    ctx = _BuildCtx(tmp_path, b"")
+    ctx.att.binary_index = "index-v3.json"
+    entry = cli.entry_from_fragment(_frag(), "meshtastic", CAND)
+    live = dict(entry, inputs={"meshtastic": "f" * 64}, published_at="2026-11-14T08:00:00Z",
+                build_run="777.1")
+    ctx.gh.release_asset = lambda repo, tag, name: json.dumps(
+        {"schema": 3, "stacks": {"meshtastic": [live]}}).encode()
+    ctx.gh.wait = lambda repo, run_id, bound: {"conclusion": "success", "workflow_id": 9,
+                                               "run_attempt": 1, "head_sha": "c" * 40,
+                                               "html_url": "https://example.invalid/b/777"}
+    ctx.gh.artifact_member = lambda repo, run_id, name, suffix, attempt=1: (
+        _frag().encode() if suffix == ".frag.json" else b"")
+    assert cli.stage_build(ctx) == 0
+    assert ctx.att.published["meshtastic"] == entry
+
+
 def test_v3_recover_leaves_a_new_composition_where_it_is():
     """Nothing to undo: only a controller with exactly these pins and inputs selects it, and no
     released one has them."""
