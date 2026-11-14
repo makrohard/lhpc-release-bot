@@ -1640,10 +1640,13 @@ def stage_release(ctx: Ctx) -> int:
         cwd=lhpc)
     # ONE ref update: a tagless main would let boxes self-update to an unreleased commit.
     git("push", "--atomic", "origin", f"{att.candidate_sha}:refs/heads/main",
-        f"refs/tags/{tag}", cwd=lhpc)
+        f"refs/tags/{tag}", cwd=lhpc, check=False)
 
-    # Believe the remote, not the exit status: a push can be accepted and its reply lost.
-    if ctx.gh.ref(LHPC, "heads/main") != att.candidate_sha or not ctx.gh.ref(LHPC, f"tags/{tag}"):
+    # Believe the remote, not the exit status: a push can be accepted and its reply lost, or
+    # refused while somebody else moved the refs. Released only when BOTH name the candidate
+    # (the tag peeled to its commit).
+    if ctx.gh.ref(LHPC, "heads/main") != att.candidate_sha \
+            or ctx.gh.ref(LHPC, f"tags/{tag}") != att.candidate_sha:
         raise Stop("release", "the atomic push did not take effect.",
                    "Nothing is released. Recover the attempt.")
     att.state = "released"
@@ -2219,14 +2222,13 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
     # ---- settle every writer this attempt started, BEFORE touching anything -------------
     unsettled = []
     # A publish was started for these and the reply was lost, so there is no run id to cancel or
-    # wait for. Silence about them is not evidence: the only safe reading is that a publisher may
-    # still be writing, so nothing may be concluded until no build is running at all.
+    # wait for. Silence about them is not evidence, and "no build is running now" is not either:
+    # that writer may have finished and published, and nothing ties its entry to this attempt.
+    # So such an attempt is never settled here; a person decides.
     forgotten = unrecorded_dispatches(att)
     if forgotten:
-        running = ctx.gh.unfinished_runs(BIN, BUILD_WORKFLOW)   # one answer, not one per stack
-        if running:
-            unsettled.append(f"{', '.join(forgotten)} dispatched with no recorded run, and "
-                             f"{len(running)} build(s) have not finished")
+        unsettled.append(f"{', '.join(forgotten)} dispatched with no recorded run, so its "
+                         f"publisher cannot be identified or waited for")
     for _name, rec in att.runs.items():
         repo = rec.get("repo", BIN) if isinstance(rec, dict) else BIN
         rid = int(rec["id"]) if isinstance(rec, dict) else int(rec)

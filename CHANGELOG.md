@@ -4,6 +4,8 @@ Milestones only.
 
 ## Unreleased
 
+- Recovery never settles a publish whose run id was lost (the attempt stays open); a release is
+  recorded only when `main` and the tag both name the candidate, whatever the push answered.
 - Recovery withdraws an unproven attempt's own binaries from index-v3.json (installed copies stay);
   a same-file entry of another run, or one without `build_run`, stays and the attempt stays open.
 - A re-run of the build stage waits on the build it recorded instead of dispatching a second
