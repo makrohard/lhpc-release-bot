@@ -36,7 +36,8 @@ By the decision it protects:
   tag on main, and the next tag still free.
 - **`test_attempt.py`** — what a run owes the world, and what a recovery may undo.
 - **`test_transaction.py`** — which binary entry this attempt may restore, and whether a
-  published image really is this release's.
+  published image really is this release's. `entry_key_vectors.json` is the same file in
+  lhpc-binaries: both repositories must compute an index-v3 entry's key alike.
 - **`test_proof.py`** — what counts as proof that THIS candidate is green, and how much
   credential a publishing run must have left.
 - **`test_gh.py`** — which failed API call is tried again (a read on something passing), and

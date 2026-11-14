@@ -455,6 +455,20 @@ def test_a_key_stands_for_the_whole_entry_and_its_composition():
     assert entry_key(rebuilt)[3] != entry_key(e)[3]
 
 
+def test_the_entry_key_is_the_one_the_binaries_repository_computes():
+    """lhpc-binaries' withdraw-v3 removes an entry by this exact key, so both repositories must
+    compute it alike. tests/entry_key_vectors.json is the same file in lhpc-binaries, whose own
+    test checks `lib_index.entry_key` against it."""
+    import json
+    from pathlib import Path
+
+    from bot.cli import entry_key
+    vectors = json.loads((Path(__file__).parent / "entry_key_vectors.json").read_text())["vectors"]
+    assert len(vectors) == 5
+    for v in vectors:
+        assert entry_key(v["entry"]) == v["key"], v["stack"]
+
+
 @pytest.mark.parametrize("ours,live,before,want", [
     ({"meshtastic": core(v3entry("6", pin="2"))}, [v3entry("6", pin="2"), v3entry("8")],
      [v3entry("8")], (["meshtastic"], [])),
