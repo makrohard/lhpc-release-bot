@@ -280,6 +280,8 @@ def test_an_unreachable_source_beside_a_move_is_reported_and_the_plan_goes_on(tm
              examine(src(A, path="src/b"), {"track": "tip"}, FakeRemote([A, B]))]
     (tmp_path / "loraham-pi-control").mkdir()
     (tmp_path / "loraham-pi-control" / cli.MANIFEST.split("/")[-1]).write_text("")
+    (tmp_path / "loraham-pi-control" / "pyproject.toml").write_text('version = "0.3.6"\n')
+    monkeypatch.setattr(cli, "tag_problems", lambda *a: [])      # its own file: test_changelog
     monkeypatch.setattr(cli, "MANIFEST", cli.MANIFEST.split("/")[-1])
     monkeypatch.setattr(cli, "git", lambda *a, **k: "b" * 40)
     monkeypatch.setattr(cli, "_findings", lambda ctx, text, policy, dev="": (found, None))

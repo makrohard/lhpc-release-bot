@@ -238,7 +238,7 @@ def test_a_v_prefixed_cycle_is_still_a_version():
 
 # ---- the version a run would release: checked at plan, before anything is published ----
 
-def _tagged_plan(tmp_path, monkeypatch, tags, on_main=True, declared="0.12.10"):
+def _tagged_plan(tmp_path, monkeypatch, tags, on_main=True, declared="0.12.10", retry_of=""):
     """`stage_plan` up to `prepare` with main at 0.12.10 (tests/test_pins_check.py's harness),
     the controller's tags as `{name: commit}` (peeled, as `GitHub.ref` returns them), whether a
     tag's commit is on main, and the version that commit's pyproject declares."""
@@ -246,6 +246,8 @@ def _tagged_plan(tmp_path, monkeypatch, tags, on_main=True, declared="0.12.10"):
     from bot import pins_check as pc
     from tests.test_pins_check import _plan_ctx
     lhpc, ctx = _plan_ctx(tmp_path, monkeypatch)
+    ctx.retry_of, ctx.claims = retry_of, []
+    monkeypatch.setattr(cli, "_claim_the_retry", lambda c: c.claims.append(c.retry_of))
     head = cli.git("rev-parse", "HEAD", cwd=lhpc)
     tags = {k: head if v == "MAIN" else v for k, v in tags.items()}
     ctx.ref = lambda repo, ref: tags.get(ref.removeprefix("tags/"), "") if ref.startswith(
@@ -289,3 +291,25 @@ def test_main_tagged_on_itself_or_an_ancestor_goes_on_to_prepare(tmp_path, monke
     tag on main itself needs no ancestry answer (`on_main=False` would refuse if it were asked)."""
     stop, _ = _tagged_plan(tmp_path, monkeypatch, {"v0.12.10": tagged}, on_main=on_main)
     assert stop.stage == "prepare" and "reached prepare" in stop.observed
+
+
+def test_a_retry_whose_move_cannot_be_released_does_not_spend_its_claim(tmp_path, monkeypatch):
+    """A hold is owed ONE retry. Validation comes before the claim (the plan's own rule), so a
+    retry child stopped by the version check leaves the claim for the run that can use it."""
+    stop, ctx = _tagged_plan(tmp_path, monkeypatch, {}, retry_of="4000")
+    assert stop.stage == "plan" and "there is no tag v0.12.10" in stop.observed
+    assert ctx.claims == []
+
+
+
+def test_a_run_that_moves_nothing_ends_green_without_asking_for_tags(tmp_path, monkeypatch):
+    """Nothing to release, nothing to check: an untagged main must not turn the weekly "nothing
+    moved" run (or a dry-run of it) red."""
+    from bot import cli
+    from tests.test_pins_check import _plan_ctx
+    lhpc, ctx = _plan_ctx(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "_findings", lambda ctx, text, policy, dev="": ([], {}))
+    asked = []
+    ctx.ref = lambda repo, ref: asked.append(ref) or ("" if ref.startswith("tags/") else "d" * 40)
+    assert cli.stage_plan(ctx) == 0
+    assert {"proceed": "false"} in ctx.outs and not [r for r in asked if r.startswith("tags/")]

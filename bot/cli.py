@@ -537,6 +537,15 @@ def stage_plan(ctx: Ctx) -> int:
     # sent to prove has been thawed — would otherwise consume the one claim the hold is owed and
     # leave the incident with a claim that led nowhere. The claim itself still settles races: it
     # re-reads the incident and stands down if another run got there first.
+    # The version check is validation too: a move that cannot be released must not spend a claim.
+    current = cl.current_version((lhpc / "pyproject.toml").read_text())
+    version = cl.next_patch(current)
+    problems = tag_problems(ctx, current, version, base_sha) if moved else []
+    if problems:
+        raise Stop("plan", f"version {version} cannot be released from this `main`:\n\n"
+                   + "\n".join(f"- {p}" for p in problems),
+                   "Nothing was pushed. Tag main's version on main (or move `main` past the "
+                   "taken tag), then re-run.")
     _check_parent(ctx, [f for f in found if f.status == "frozen"])
     _claim_the_retry(ctx)
 
@@ -570,14 +579,6 @@ def stage_plan(ctx: Ctx) -> int:
         ctx.out(proceed="false")
         return 0
 
-    current = cl.current_version((lhpc / "pyproject.toml").read_text())
-    version = cl.next_patch(current)
-    problems = tag_problems(ctx, current, version, base_sha)
-    if problems:
-        raise Stop("plan", f"version {version} cannot be released from this `main`:\n\n"
-                   + "\n".join(f"- {p}" for p in problems),
-                   "Nothing was pushed. Tag main's version on main (or move `main` past the "
-                   "taken tag), then re-run.")
     branch = f"pins/{version}-{ctx.run_id}"
 
     # ---- the edit -------------------------------------------------------------------------
