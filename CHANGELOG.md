@@ -4,6 +4,8 @@ Milestones only.
 
 ## Unreleased
 
+- The attempt record keeps the index-v3 snapshot as one short key per entry, so it stays far
+  below GitHub's issue-body cap; records holding whole entries still read.
 - The plan stops, nothing pushed, unless main's version is tagged on main and the next tag is
   free; a rate-limited upstream is skipped for the week instead of stopping every move.
 - One GitHub blip no longer strands an attempt: a run id is kept from its dispatch reply, and a

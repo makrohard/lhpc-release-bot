@@ -341,3 +341,38 @@ def test_a_failed_read_after_a_dispatch_keeps_the_run_and_its_identity(tmp_path,
                        "sha": "c" * 40}]                         # saved before it is judged
     cli._auto_freeze(ctx, 5, ctx.att)
     assert ctx.att.regression == ["meshtastic"]
+
+
+def test_a_record_built_from_a_full_history_index_stays_small(tmp_path, monkeypatch):
+    """The record lives in an issue body, which GitHub caps at 65,536 characters. With the whole
+    index-v3 history inside it, it grew 18,070 -> 33,669 characters over four attempts."""
+    import json
+
+    from bot import cli
+    from tests.test_autofreeze import BUILD_POLICY, _BuildCtx
+
+    def v3(stack, n):
+        sha = f"{n:064x}"
+        return {"filename": f"{stack}-{sha}.tar.zst", "sha256": sha, "size": 41_000_000 + n,
+                "url": f"https://example.invalid/releases/download/binaries/{stack}-{sha}.tar.zst",
+                "built_from": f"{n:040x}", "components": {stack: f"{n:040x}",
+                                                          f"{stack}-qemu": f"{n + 1:040x}"},
+                "lhpc_commit": f"{n + 2:040x}", "builder_commit": f"{n + 3:040x}",
+                "target": "aarch64-trixie", "os": "trixie",
+                "container_digest": "debian@sha256:" + f"{n:064x}",
+                "runtime_deps": [f"lib{stack}-dep{i}" for i in range(12)],
+                "smoke": {"mode": "mandatory", "result": "passed"}, "extract_to": "runtime-root",
+                "inputs": {stack: f"{n + 4:064x}"}, "published_at": "2026-11-10T03:51:59Z"}
+    index = {"schema": 3, "stacks": {s: [v3(s, 10 * i + k) for k in range(6)]
+                                     for i, s in enumerate(("meshtastic", "meshcom", "daemon"))}}
+    assert len(json.dumps(index, indent=2)) > 25_000          # about the size #73 embedded
+    monkeypatch.setenv("BINARY_STACK", "meshtastic")
+    monkeypatch.setattr(cli, "MANIFEST", "m.toml")
+    monkeypatch.setattr(cli.up, "load_policy", lambda p: BUILD_POLICY)
+    monkeypatch.setattr(cli, "git", lambda *a, **k: "")
+    ctx = _BuildCtx(tmp_path, b"")
+    ctx.att.binary_index = "index-v3.json"
+    ctx.gh.release_asset = lambda repo, tag, name: json.dumps(index).encode()
+    with pytest.raises(cli.Stop):
+        cli.stage_build(ctx)
+    assert len(ctx.att.to_body()) < 10_000
