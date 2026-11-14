@@ -86,3 +86,17 @@ def test_the_heartbeat_is_a_schedule_only_job_that_may_write_contents():
     assert "needs:" not in job                                     # nothing can skip it
     assert re.search(r"(?m)^      - run: python -m bot\.cli heartbeat$", job)
     assert workflow.count("bot.cli heartbeat") == 1
+
+
+def test_the_job_s_own_command_runs_the_heartbeat(tmp_path, monkeypatch):
+    """The job runs `python -m bot.cli heartbeat`; that verb must reach the stage, not the
+    release's stage table."""
+    from bot import cli
+    remote = _remote_with_main_dated(tmp_path, 29)
+    ctx = _Ctx(tmp_path, remote)
+    ctx.work = tmp_path / "work-dir"
+    monkeypatch.setattr(cli, "Ctx", lambda: ctx)
+    monkeypatch.setattr(cli.time, "time", lambda: NOW)
+    assert cli.main(["heartbeat"]) == 0
+    assert _git("log", "-1", "--format=%s", "main", cwd=remote) == (
+        "heartbeat: keep the weekly schedule active")
