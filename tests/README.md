@@ -32,7 +32,8 @@ By the decision it protects:
 - **`test_manifest_edit.py`** — moving a pin and the Graywolf version without touching anything
   else.
 - **`test_changelog.py`** — the version scalars and the changelog, including the one conflict
-  with `dev` that is resolved automatically.
+  with `dev` that is resolved automatically. Also whether main's version may be released at all: its
+  tag on main, and the next tag still free.
 - **`test_attempt.py`** — what a run owes the world, and what a recovery may undo.
 - **`test_transaction.py`** — which binary entry this attempt may restore, and whether a
   published image really is this release's.

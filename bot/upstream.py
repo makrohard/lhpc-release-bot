@@ -14,6 +14,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .gh import rate_limited
+
 # A RELEASE tag is a whole name of optional `v` plus dot-separated numbers — the same shape
 # LHPC's own `--source stable` accepts. A build-suffixed (`v2.8.0.7239fe8`) or prerelease
 # (`1.8.2-pre`) name is a snapshot, not a release.
@@ -130,6 +132,11 @@ class Remote:
         try:
             with urllib.request.urlopen(req, timeout=30) as r:      # noqa: S310 (fixed host)
                 data = json.load(r)
+        except urllib.error.HTTPError as exc:
+            if rate_limited(exc.code, exc.headers):     # skipped for the week, like an outage
+                raise RuntimeError(f"cannot read releases of {repo}: rate limit "
+                                   f"(HTTP {exc.code})") from None
+            raise RuntimeError(f"cannot read releases of {repo}: {exc}") from None
         except (urllib.error.URLError, ValueError, OSError) as exc:
             raise RuntimeError(f"cannot read releases of {repo}: {exc}") from None
         for rel in data:

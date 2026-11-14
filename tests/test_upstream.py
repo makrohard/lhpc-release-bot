@@ -279,3 +279,45 @@ def test_a_rule_pinned_neither_on_main_nor_on_dev_still_stops():
 def test_dev_never_excuses_a_source_main_pins_without_a_rule():
     gaps = policy_gaps({"source": {"src/a": {}}}, ["src/a", "src/new"], ["src/a", "src/new"])
     assert gaps == ["src/new: pinned in the manifest, absent from policy.toml"]
+
+
+# ---- a rate-limited release read is skipped for the week; any other refusal is a fault ----
+
+class _ApiRemote(FakeRemote):
+    """The git side faked, the release read REAL (`Remote.latest_release`) over a fake urlopen."""
+    token = ""                  # no credential: the request goes out without one
+
+    def latest_release(self, repo):
+        from bot.upstream import Remote
+        return Remote.latest_release(self, repo)
+
+
+def _refused(monkeypatch, code, **headers):
+    import email.message
+    import io
+    import urllib.error
+
+    from bot import upstream as up
+    msg = email.message.Message()
+    for k, v in headers.items():
+        msg[k.replace("_", "-")] = v
+
+    def urlopen(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, code, "Forbidden", msg, io.BytesIO(b""))
+    monkeypatch.setattr(up.urllib.request, "urlopen", urlopen)    # the fake: no network
+
+
+@pytest.mark.parametrize("code,headers,status", [
+    (403, {"x_ratelimit_remaining": "0"}, "skipped"), (429, {}, "skipped"),
+    (403, {}, "fault"), (404, {}, "fault")],
+    ids=["403-rate-limit", "429", "403-permission", "404"])
+def test_a_rate_limited_release_read_skips_the_source_and_a_refusal_is_a_fault(
+        monkeypatch, code, headers, status):
+    """GitHub's rate-limit 403 says so in its headers, not in urllib's text, so it read as a fault
+    and stopped every move that week. The same helper the API client uses decides it here."""
+    _refused(monkeypatch, code, **headers)
+    remote = _ApiRemote([A, B], tags={"v1.0.0": B})
+    git = examine(src(A), {"track": "release"}, remote)
+    extra = examine_extra("graywolf", {"kind": "github-release", "repo": "o/r",
+                                       "track": "release"}, "0.14.12", remote)
+    assert (git.status, extra.status) == (status, status)
