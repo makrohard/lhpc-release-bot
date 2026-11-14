@@ -2428,6 +2428,28 @@ def _web_upstream(ctx: Ctx) -> tuple:
     return want, problems
 
 
+# GitHub switches off the schedule of a public repository after 60 days without activity.
+HEARTBEAT_DAYS = 28
+
+
+def stage_heartbeat(ctx: Ctx, now: float | None = None) -> int:
+    """The maintainer's Q2: when the newest commit on this repository's `main` is older than
+    HEARTBEAT_DAYS, push one empty commit to it, so the weekly schedule stays on. Every other
+    landing on `main` resets GitHub's counter too, and then this pushes nothing. A `main` that
+    moved meanwhile refuses the plain push; the next week tries again."""
+    bot = ctx.clone(BOT, "main", token=ctx.bot_token or ctx.token)
+    age = (time.time() if now is None else now) - int(git("log", "-1", "--format=%ct", cwd=bot))
+    if age < HEARTBEAT_DAYS * 86400:
+        print(f"heartbeat: the newest commit on main is {int(age // 86400)} days old; nothing to do")
+        return 0
+    git("commit", "-q", "--allow-empty", "-m", "heartbeat: keep the weekly schedule active",
+        cwd=bot)
+    git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=bot)
+    ctx.summary(f"\nheartbeat: main had no commit for {int(age // 86400)} days; one empty commit "
+                "pushed to keep the weekly schedule active.")
+    return 0
+
+
 def stage_web(ctx: Ctx, dry: bool = False) -> int:
     """Keep each web-client channel's SELECTED entry current (bot/web.py), on `main`'s pin.
 
@@ -2501,11 +2523,18 @@ def stage_web(ctx: Ctx, dry: bool = False) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="bot")
     ap.add_argument("stage", choices=("plan", "build", "prove", "release", "integrate",
-                                      "image", "finalize", "recover", "web"))
+                                      "image", "finalize", "recover", "web", "heartbeat"))
     ap.add_argument("--attempt", default="")
     ap.add_argument("--dry-run", action="store_true", help="web: print the decision only")
     args = ap.parse_args(argv)
     ctx = Ctx()
+    if args.stage == "heartbeat":
+        # Outside the release's error path too: it holds no attempt, and a failure is this job's
+        # own red, which a person reads in the run.
+        try:
+            return stage_heartbeat(ctx)
+        finally:
+            shutil.rmtree(ctx.work, ignore_errors=True)
     if args.stage == "web":
         # Not the release's error path: the web stage holds no attempt; an unexpected failure
         # ends only this job, which `continue-on-error` keeps out of the run's result.
