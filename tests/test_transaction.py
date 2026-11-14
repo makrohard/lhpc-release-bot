@@ -702,3 +702,16 @@ def test_an_own_entry_from_before_build_run_stops_without_a_withdrawal():
     with pytest.raises(cli.Stop, match="without the run that published it"):
         _recover(ctx)
     assert ctx.dispatches == [] and ctx.att.state == "mutated"
+
+
+def test_an_unrecorded_dispatch_is_never_settled_even_with_no_build_running():
+    """The dispatch reply was lost: no run id. No build running now does not mean none wrote:
+    it may have published and finished. The attempt stays open; nothing is withdrawn or closed."""
+    from bot import cli
+    old = v3entry("8")
+    ctx = _RecoverCtx(fragment=None, live=[old], snapshot=[old])
+    del ctx.att.runs["binary:meshtastic"]
+    with pytest.raises(cli.Stop, match="has not stopped") as stop:
+        _recover(ctx)
+    assert "meshtastic dispatched with no recorded run" in stop.value.observed
+    assert ctx.dispatches == [] and ctx.att.state == "mutated" and ctx.closed == []
