@@ -305,6 +305,29 @@ def _wait(ctx, rec: dict, bound: float, att: Attempt | None = None, number: int 
     return run
 
 
+def tag_problems(ctx, current: str, version: str, base_sha: str) -> list:
+    """Why `version` (main's version + 1) cannot be the next release, before anything is
+    published. Main's own version must be tagged ON main (the tag's commit is main or an
+    ancestor of it; rule A12 releases main's later commits as the next patch) and that commit
+    must declare the version; the next tag must still be free."""
+    problems, tag = [], f"v{current}"
+    tagged = ctx.gh.ref(LHPC, f"tags/{tag}")                 # an annotated tag is peeled
+    if not tagged:
+        problems.append(f"`main` is at {current}, but there is no tag {tag}")
+    elif tagged != base_sha and not ctx.gh.is_ancestor(LHPC, tagged, base_sha):
+        problems.append(f"{tag} is on {tagged[:9]}, which is not on `main`")
+    else:
+        try:
+            declared = cl.current_version(ctx.gh.file_at(LHPC, "pyproject.toml", tagged))
+        except ValueError:
+            declared = "no version"
+        if declared != current:
+            problems.append(f"{tag} is on {tagged[:9]}, whose pyproject.toml says {declared}")
+    if ctx.gh.ref(LHPC, f"tags/v{version}"):
+        problems.append(f"the tag v{version} already exists")
+    return problems
+
+
 def _findings(ctx: Ctx, manifest_text: str, policy: dict, dev_manifest_text: str = "") -> tuple:
     sources = mf.pinned_sources(manifest_text)
     dev = [s.path for s in mf.pinned_sources(dev_manifest_text)] if dev_manifest_text else []
@@ -547,7 +570,14 @@ def stage_plan(ctx: Ctx) -> int:
         ctx.out(proceed="false")
         return 0
 
-    version = cl.next_patch(cl.current_version((lhpc / "pyproject.toml").read_text()))
+    current = cl.current_version((lhpc / "pyproject.toml").read_text())
+    version = cl.next_patch(current)
+    problems = tag_problems(ctx, current, version, base_sha)
+    if problems:
+        raise Stop("plan", f"version {version} cannot be released from this `main`:\n\n"
+                   + "\n".join(f"- {p}" for p in problems),
+                   "Nothing was pushed. Tag main's version on main (or move `main` past the "
+                   "taken tag), then re-run.")
     branch = f"pins/{version}-{ctx.run_id}"
 
     # ---- the edit -------------------------------------------------------------------------

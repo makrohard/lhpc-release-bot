@@ -376,7 +376,14 @@ class _PlanCtx:
         return {}
 
     def ref(self, repo, ref):
-        return "d" * 40
+        # main's version is tagged on main and the next tag is free (the plan's tag check)
+        return "" if ref == "tags/v0.12.11" else "d" * 40
+
+    def is_ancestor(self, repo, ancestor, descendant):
+        return True
+
+    def file_at(self, repo, path, sha):
+        return (self.lhpc / path).read_text()
 
     def open_attempts(self):
         return []

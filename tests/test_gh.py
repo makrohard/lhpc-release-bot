@@ -130,3 +130,19 @@ def test_ancestry_is_false_only_when_github_does_not_know_the_commits(api):
     api["script"] = [_http(500)] * 4
     with pytest.raises(GitHubError, match="-> 500"):
         GitHub("t").is_ancestor("o/r", "a" * 40, "b" * 40)
+
+
+@pytest.mark.parametrize("first,then,want", [
+    ({"object": {"type": "commit", "sha": "c" * 40}}, None, "c" * 40),
+    ({"object": {"type": "tag", "sha": "a" * 40}}, {"object": {"sha": "c" * 40}}, "c" * 40)],
+    ids=["lightweight", "annotated"])
+def test_a_tag_resolves_to_its_commit_whether_lightweight_or_annotated(api, first, then, want):
+    """The plan's tag checks compare the tag's COMMIT with main; an annotated tag's own object
+    sha would never be on main."""
+    api["script"] = [json.dumps(first).encode()] + ([json.dumps(then).encode()] if then else [])
+    assert GitHub("t").ref("o/r", "tags/v0.14.0") == want
+
+
+def test_a_missing_tag_is_empty(api):
+    api["script"] = [_http(404)]
+    assert GitHub("t").ref("o/r", "tags/v0.14.0") == ""

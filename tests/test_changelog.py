@@ -234,3 +234,58 @@ def test_a_v_prefixed_cycle_is_still_a_version():
         except ValueError:
             continue
         raise AssertionError(f"{junk!r} has no version at its start and must not parse as one")
+
+
+# ---- the version a run would release: checked at plan, before anything is published ----
+
+def _tagged_plan(tmp_path, monkeypatch, tags, on_main=True, declared="0.12.10"):
+    """`stage_plan` up to `prepare` with main at 0.12.10 (tests/test_pins_check.py's harness),
+    the controller's tags as `{name: commit}` (peeled, as `GitHub.ref` returns them), whether a
+    tag's commit is on main, and the version that commit's pyproject declares."""
+    from bot import cli
+    from bot import pins_check as pc
+    from tests.test_pins_check import _plan_ctx
+    lhpc, ctx = _plan_ctx(tmp_path, monkeypatch)
+    head = cli.git("rev-parse", "HEAD", cwd=lhpc)
+    tags = {k: head if v == "MAIN" else v for k, v in tags.items()}
+    ctx.ref = lambda repo, ref: tags.get(ref.removeprefix("tags/"), "") if ref.startswith(
+        "tags/") else "d" * 40
+    ctx.is_ancestor = lambda repo, a, b: on_main
+    ctx.file_at = lambda repo, path, sha: (                # main itself says 0.12.10
+        "" if declared is None and sha == tags.get("v0.12.10") else
+        f'[project]\nversion = "{declared if sha == tags.get("v0.12.10") else "0.12.10"}"\n')
+
+    def reached(*a, **k):
+        raise pc.CheckFailed("reached prepare", "", "")
+    monkeypatch.setattr(pc, "check_lock", reached)
+    with pytest.raises(cli.Stop) as stop:
+        cli.stage_plan(ctx)
+    return stop.value, ctx
+
+
+@pytest.mark.parametrize("tags,on_main,declared,why", [
+    ({}, True, "0.12.10", "there is no tag v0.12.10"),
+    ({"v0.12.10": "e" * 40}, False, "0.12.10", "which is not on `main`"),
+    ({"v0.12.10": "e" * 40}, True, "0.12.9", "whose pyproject.toml says 0.12.9"),
+    ({"v0.12.10": "e" * 40}, True, None, "whose pyproject.toml says no version"),
+    ({"v0.12.10": "e" * 40, "v0.12.11": "f" * 40}, True, "0.12.10",
+     "the tag v0.12.11 already exists")],
+    ids=["main-untagged", "tag-off-main", "tag-declares-another-version", "tag-declares-none",
+         "next-tag-taken"])
+def test_a_version_that_cannot_be_released_stops_the_plan_with_nothing_pushed(
+        tmp_path, monkeypatch, tags, on_main, declared, why):
+    """Main at 0.14.0 with no v0.14.0 tag made the bot release v0.14.1, and a taken tag was found
+    only after the binaries were published. Both now stop at plan: no record, no branch."""
+    stop, ctx = _tagged_plan(tmp_path, monkeypatch, tags, on_main, declared)
+    assert stop.stage == "plan" and why in stop.observed
+    assert ctx.saved == []                       # no attempt record: nothing was pushed
+
+
+@pytest.mark.parametrize("tagged,on_main", [("e" * 40, True), ("MAIN", False)],
+                         ids=["tag-on-an-ancestor", "tag-is-main"])
+def test_main_tagged_on_itself_or_an_ancestor_goes_on_to_prepare(tmp_path, monkeypatch, tagged,
+                                                                  on_main):
+    """Rule A12: main may carry commits after its tag; they are released as the next patch. A
+    tag on main itself needs no ancestry answer (`on_main=False` would refuse if it were asked)."""
+    stop, _ = _tagged_plan(tmp_path, monkeypatch, {"v0.12.10": tagged}, on_main=on_main)
+    assert stop.stage == "prepare" and "reached prepare" in stop.observed

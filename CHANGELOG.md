@@ -4,6 +4,8 @@ Milestones only.
 
 ## Unreleased
 
+- The plan stops, nothing pushed, unless main's version is tagged on main and the next tag is
+  free; a rate-limited upstream is skipped for the week instead of stopping every move.
 - One GitHub blip no longer strands an attempt: a run id is kept from its dispatch reply, and a
   failed read is tried again (4 tries; never a write).
 - Binaries go into the index the candidate's manifest names: `index.json`, or the history
