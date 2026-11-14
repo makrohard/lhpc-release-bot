@@ -664,6 +664,36 @@ def test_a_snapshot_entry_replaced_by_the_same_file_of_another_run_is_named():
     assert ctx.dispatches == []
 
 
+def test_the_withdraw_run_is_recorded_before_recovery_waits_for_it():
+    """If recovery is lost during the wait, the next one must find the `rollback` run to wait for
+    (the interrupted-withdrawal case below starts from that record)."""
+    old, mine = v3entry("8"), _own()
+    ctx = _RecoverCtx(fragment=core(mine), live=[mine, old], snapshot=[old])
+    saved, save = [], ctx.save_attempt
+    ctx.save_attempt = lambda number, att: saved.append(dict(att.runs)) or save(number, att)
+    wait = ctx.wait
+
+    def checked(repo, run_id, bound, **kw):
+        if int(run_id) == 900:
+            assert saved and saved[-1].get("rollback", {}).get("id") == 900, \
+                "the withdraw run must be saved in the record before the wait"
+        return wait(repo, run_id, bound, **kw)
+
+    ctx.wait = checked
+    assert _recover(ctx) == 0
+
+
+def test_an_own_entry_of_the_rerun_attempt_this_bot_asked_for_is_withdrawn():
+    """The build wait moved the record to attempt 2 (a re-run this bot asked for); the entry that
+    attempt published (`build_run` 777.2) is this attempt's own."""
+    from bot import cli
+    old, mine = v3entry("8"), _own(run="777.2")
+    ctx = _RecoverCtx(fragment=core(mine), live=[mine, old], snapshot=[old],
+                      runs={"binary:meshtastic": dict(BUILD, attempt=2, repo=cli.BIN)})
+    assert _recover(ctx) == 0
+    assert len(ctx.dispatches) == 1 and ctx.index["stacks"]["meshtastic"] == [old]
+
+
 def test_a_recovery_after_an_interrupted_withdrawal_waits_for_it_and_does_not_withdraw_again():
     """The last recover stopped while its withdraw run was going; the run finished and removed
     the entry. This one settles that run first, then finds nothing of ours left."""
