@@ -289,6 +289,37 @@ def test_recovery_on_an_advanced_record_regresses_nothing(tmp_path):
     assert att.owes == [], att.owes      # integration recorded and image published: nothing left
 
 
+@pytest.mark.parametrize("moved", ["main", "tag"])
+def test_a_refused_push_with_one_ref_on_the_candidate_is_not_a_release(tmp_path, monkeypatch,
+                                                                         moved):
+    """The atomic push is refused while somebody else moved the refs: `main` reads as the
+    candidate with the tag on another commit, or the tag on the candidate with `main` elsewhere.
+    A ref that merely exists is not this release: both must name the candidate, and the stage
+    must stop, not raise out of the failed push."""
+    remote = _Remote(tmp_path)
+    att = _att(base_sha=remote.base, candidate_sha=remote.candidate)
+    real_git = cli.git
+
+    def racing_git(*args, cwd=None, check=True):
+        if args[:2] == ("push", "--atomic"):
+            if moved == "main":
+                git("push", "-q", "origin", f"{remote.candidate}:refs/heads/main",
+                    cwd=remote.work)
+                git("tag", "v0.3.16", remote.base, cwd=remote.bare)     # theirs, on the base
+            else:
+                git("tag", "v0.3.16", remote.candidate, cwd=remote.bare)   # main stays on base
+            if check:
+                raise RuntimeError("git push --atomic: rejected (stale info)")
+            return ""
+        return real_git(*args, cwd=cwd, check=check)
+
+    monkeypatch.setattr(cli, "git", racing_git)
+    ctx = _Ctx(remote, att)
+    with pytest.raises(cli.Stop, match="did not take effect"):
+        cli.stage_release(ctx)
+    assert ctx.stored().state != "released"
+
+
 def test_a_version_held_by_another_candidate_is_still_a_conflict(tmp_path):
     """The promotion must key on THIS attempt's release existing, never on a tag of the same
     name. Somebody else's release of the same version may not be adopted."""
