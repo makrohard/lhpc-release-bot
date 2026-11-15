@@ -125,8 +125,9 @@ the channel's typed message and offered the source build. Installed boxes are un
   `GITHUB_TOKEN` writes it. Diagnostics are best-effort; the rest is never omitted.
   A stop of an attempt reports into that attempt's issue. A stop that belongs to no attempt and
   has a named reason (an unresolved earlier attempt, an untagged version, a token problem, ...)
-  reports into ONE open issue per stage, version and reason: later runs add a comment. Only one
-  release run runs at a time (the workflow's `release` concurrency group, pinned by
+  reports into ONE open issue per stage, version and reason: later runs add a comment. Only the
+  release workflow files these reports (a job of any other workflow files none), and only one
+  release run runs at a time (its `release` concurrency group, pinned by
   tests/test_one_reporter.py), so two reports never race; should duplicates exist anyway (an
   issue opened by hand, an interrupted cleanup), the next report keeps the lowest-numbered one
   and closes the others as its duplicates.

@@ -1,38 +1,34 @@
 """No two stop reports ever run at the same time, so one key never gets two open issues by a race.
 
-`_report_stop` is reached only from `main`'s error path, for every stage but `web` and `heartbeat`.
-These tests pin the facts that make two reporters at once impossible, read from the parsed
-workflow files (yaml.safe_load), never from line patterns:
-1. of all workflows (*.yml and *.yaml), only release.yml invokes a reporting stage, in any `run:`
-   string, multiline ones included;
+1. At run time, `_report_stop` files only in a job of the release workflow (GITHUB_WORKFLOW is its
+   `name:`); a report from any other workflow, which could run beside a release run, is refused.
 2. release.yml is ONE concurrency group, `release`, never cancelled in progress, which no job
-   overrides: one release run at a time;
-3. inside one run, the reporting jobs' `needs` and their WHOLE `if:` expressions are exactly the
-   reviewed ones below. With them, two reporting jobs either depend on each other or cannot both
-   run: a `finish-*` job runs only in `finish` mode, where `plan` (the root of every other chain)
-   never runs; integrate/image/finalize need `release` to have SUCCEEDED, while `recover` runs only
-   in `recover` mode (no plan, so no release) or when a stage before them failed or was cancelled.
-   Any change to one of these expressions fails here and must be reviewed against that argument.
+   overrides; its one matrix (`build`) runs one instance at a time: one release run, and in it
+   one instance of each job at a time.
+3. Inside one run, the reporting jobs' `needs` and their WHOLE `if:` expressions are exactly the
+   reviewed ones below, and release.yml has no job but these and `web`/`heartbeat`. With them, two
+   reporting jobs either depend on each other or cannot both run: a `finish-*` job runs only in
+   `finish` mode, where `plan` (the root of every other chain) never runs; integrate/image/finalize
+   need `release` to have SUCCEEDED, while `recover` runs only in `recover` mode (no plan, so no
+   release) or when a stage before them failed or was cancelled. Any change to one of these fails
+   here and must be reviewed against that argument.
 4. `web` and `heartbeat`, which may run beside them, return before the report path, whatever they
-   raise; every `_report_stop` call is in `main` (bot/cli.py's AST).
+   raise.
 `_file_report` still reconciles on every report, so a duplicate left by anything else (an issue
 opened by hand, an interrupted cleanup) converges at the next report.
 """
 from __future__ import annotations
 
-import ast
-import re
 from pathlib import Path
 
 import pytest
 import yaml
 
 from bot import cli
+from tests.test_report import _plan_stop, _StopCtx, _StopStore
 
-ROOT = Path(__file__).resolve().parents[1]
-FLOWS = ROOT / ".github" / "workflows"
+RELEASE_YML = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
 NOT_REPORTING = {"web", "heartbeat"}
-INVOKE = re.compile(r"bot[./]cli(?:\.py)?\s+([a-z][a-z-]*)")
 
 EXPECTED = {   # reporting job: (needs, whole `if:`, whitespace normalised)
     "plan": ([], "${{ (github.event_name != 'schedule' || vars.SCHEDULE_ENABLED == 'true') && "
@@ -63,44 +59,48 @@ EXPECTED = {   # reporting job: (needs, whole `if:`, whitespace normalised)
 }
 
 
-def _flows() -> dict:
-    found = sorted([*FLOWS.glob("*.yml"), *FLOWS.glob("*.yaml")])
-    assert found, "no workflow found"
-    return {p.name: yaml.safe_load(p.read_text()) for p in found}
+def _release() -> dict:
+    return yaml.safe_load(RELEASE_YML.read_text())
 
 
-def _stages(job: dict) -> set:
-    runs = "\n".join(str(s.get("run", "")) for s in job.get("steps") or [])
-    assert ("bot.cli" in runs or "bot/cli" in runs) <= bool(INVOKE.search(runs)), \
-        f"a bot invocation this test cannot read: {runs!r}"
-    return set(INVOKE.findall(runs))
+@pytest.mark.parametrize("workflow", ["", "ci", "release-copy", "Release"])
+def test_a_report_outside_the_release_workflow_files_nothing(monkeypatch, workflow):
+    if workflow:
+        monkeypatch.setenv("GITHUB_WORKFLOW", workflow)
+    else:
+        monkeypatch.delenv("GITHUB_WORKFLOW")
+    store = _StopStore()
+    cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
+    assert store.issues == {} and store.notes == {}
 
 
-def _needs(job: dict) -> list:
-    n = job.get("needs") or []
-    return [n] if isinstance(n, str) else list(n)
+def test_a_report_in_the_release_workflow_files_its_issue():
+    store = _StopStore()
+    cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
+    assert list(store.issues) == [1]
 
 
-def _reporting(flow: dict) -> dict:
-    return {n: j for n, j in (flow.get("jobs") or {}).items() if _stages(j) - NOT_REPORTING}
+def test_the_reporting_workflow_is_release_yml_by_its_name():
+    assert _release()["name"] == cli.REPORTING_WORKFLOW
 
 
-def test_only_release_yml_invokes_a_reporting_stage():
-    assert [name for name, flow in _flows().items() if _reporting(flow)] == ["release.yml"]
-
-
-def test_the_release_workflow_is_one_uncancelled_group_that_no_job_overrides():
-    flow = _flows()["release.yml"]
+def test_one_release_run_at_a_time_with_one_instance_of_each_job_at_a_time():
+    flow = _release()
     assert flow["concurrency"] == {"group": "release", "cancel-in-progress": False}
     assert [n for n, j in flow["jobs"].items() if "concurrency" in j] == []
+    # The one matrix, `build`, runs its instances one after another: max-parallel 1.
+    assert {n: j["strategy"] for n, j in flow["jobs"].items() if "strategy" in j} == {
+        "build": {"max-parallel": 1, "fail-fast": True,
+                  "matrix": {"stack": "${{ fromJSON(needs.plan.outputs.binary_stacks_json) }}"}}}
 
 
-def test_the_reporting_jobs_and_their_conditions_are_exactly_the_reviewed_ones():
-    rep = _reporting(_flows()["release.yml"])
-    assert sorted(rep) == sorted(EXPECTED)
+def test_the_jobs_and_the_reporting_conditions_are_exactly_the_reviewed_ones():
+    jobs = _release()["jobs"]
+    assert sorted(jobs) == sorted({*EXPECTED, *NOT_REPORTING})
     for name, (needs, cond) in EXPECTED.items():
-        assert _needs(rep[name]) == needs, name
-        assert " ".join(str(rep[name].get("if", "")).split()) == cond, name
+        got = jobs[name].get("needs") or []
+        assert ([got] if isinstance(got, str) else list(got)) == needs, name
+        assert " ".join(str(jobs[name].get("if", "")).split()) == cond, name
 
 
 @pytest.mark.parametrize("stage", sorted(NOT_REPORTING))
@@ -130,15 +130,3 @@ def test_an_unexpected_error_in_a_stage_takes_the_generic_report_and_is_raised(m
         cli.main(["plan"])
     assert len(reported) == 1 and "unexpected RuntimeError" in reported[0].observed
     assert reported[0].code == "", "an unnamed cause is never merged"
-
-
-def test_every_report_call_is_in_main():
-    callers = []
-    for path in sorted((ROOT / "bot").glob("*.py")):
-        tree = ast.parse(path.read_text())
-        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
-            for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
-                name = getattr(call.func, "id", getattr(call.func, "attr", ""))
-                if name == "_report_stop":
-                    callers.append((path.name, fn.name))
-    assert callers == [("cli.py", "main")] * 3
