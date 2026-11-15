@@ -1,133 +1,144 @@
 """No two stop reports ever run at the same time, so one key never gets two open issues by a race.
 
 `_report_stop` is reached only from `main`'s error path, for every stage but `web` and `heartbeat`.
-These tests pin the three facts that make two reporters at once impossible:
-1. only release.yml runs a reporting stage, and that whole workflow is ONE concurrency group,
-   `release`, never cancelled in progress, which no job overrides: one release run at a time;
-2. inside one run, two reporting jobs either depend on each other or can never both run (their
-   `if`s exclude each other: by the dispatched mode, or by the result of `release`);
-3. `web` and `heartbeat`, which may run beside the others, return before the report path.
+These tests pin the facts that make two reporters at once impossible, read from the parsed
+workflow files (yaml.safe_load), never from line patterns:
+1. of all workflows (*.yml and *.yaml), only release.yml invokes a reporting stage, in any `run:`
+   string, multiline ones included;
+2. release.yml is ONE concurrency group, `release`, never cancelled in progress, which no job
+   overrides: one release run at a time;
+3. inside one run, the reporting jobs' `needs` and their WHOLE `if:` expressions are exactly the
+   reviewed ones below. With them, two reporting jobs either depend on each other or cannot both
+   run: a `finish-*` job runs only in `finish` mode, where `plan` (the root of every other chain)
+   never runs; integrate/image/finalize need `release` to have SUCCEEDED, while `recover` runs only
+   in `recover` mode (no plan, so no release) or when a stage before them failed or was cancelled.
+   Any change to one of these expressions fails here and must be reviewed against that argument.
+4. `web` and `heartbeat`, which may run beside them, return before the report path, whatever they
+   raise; every `_report_stop` call is in `main` (bot/cli.py's AST).
 `_file_report` still reconciles on every report, so a duplicate left by anything else (an issue
 opened by hand, an interrupted cleanup) converges at the next report.
 """
 from __future__ import annotations
 
+import ast
 import re
-from itertools import combinations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from bot import cli
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+FLOWS = ROOT / ".github" / "workflows"
 NOT_REPORTING = {"web", "heartbeat"}
-STAGE = re.compile(r"(?m)^\s+(?:- )?run: python -m bot\.cli ([a-z-]+)")
+INVOKE = re.compile(r"bot[./]cli(?:\.py)?\s+([a-z][a-z-]*)")
+
+EXPECTED = {   # reporting job: (needs, whole `if:`, whitespace normalised)
+    "plan": ([], "${{ (github.event_name != 'schedule' || vars.SCHEDULE_ENABLED == 'true') && "
+                 "((inputs.mode || 'full') == 'full' || inputs.mode == 'watch-only' || "
+                 "inputs.mode == 'dry-run') }}"),
+    "build": (["plan"], "${{ needs.plan.outputs.proceed == 'true' && "
+                        "needs.plan.outputs.binary_stacks != '' }}"),
+    "prove": (["plan", "build"], "${{ always() && needs.plan.outputs.proceed == 'true' && "
+                                 "needs.build.result != 'failure' && "
+                                 "needs.build.result != 'cancelled' }}"),
+    "release": (["plan", "prove"], "${{ always() && needs.plan.outputs.proceed == 'true' && "
+                                   "needs.prove.result == 'success' }}"),
+    "integrate": (["plan", "release"], "${{ !cancelled() && needs.release.result == 'success' }}"),
+    "image": (["plan", "release", "integrate"],
+              "${{ !cancelled() && needs.release.result == 'success' }}"),
+    "finalize": (["plan", "release", "integrate", "image"],
+                 "${{ !cancelled() && needs.release.result == 'success' }}"),
+    "recover": (["plan", "build", "prove", "release"],
+                "${{ always() && (inputs.mode == 'recover' || needs.plan.result == 'failure' || "
+                "needs.plan.result == 'cancelled' || needs.build.result == 'failure' || "
+                "needs.build.result == 'cancelled' || needs.prove.result == 'failure' || "
+                "needs.prove.result == 'cancelled' || needs.release.result == 'failure' || "
+                "needs.release.result == 'cancelled') }}"),
+    "finish-integrate": ([], "${{ inputs.mode == 'finish' }}"),
+    "finish-image": (["finish-integrate"], "${{ always() && inputs.mode == 'finish' }}"),
+    "finish-close": (["finish-integrate", "finish-image"],
+                     "${{ always() && inputs.mode == 'finish' }}"),
+}
 
 
-def _jobs(text: str) -> dict:
-    body = text.split("\njobs:\n", 1)[1]
-    parts = re.split(r"(?m)^  ([a-z][a-z-]*):\n", body)[1:]
-    return dict(zip(parts[::2], parts[1::2], strict=True))
+def _flows() -> dict:
+    found = sorted([*FLOWS.glob("*.yml"), *FLOWS.glob("*.yaml")])
+    assert found, "no workflow found"
+    return {p.name: yaml.safe_load(p.read_text()) for p in found}
 
 
-def _needs(job: str) -> set:
-    m = re.search(r"(?m)^    needs: (\[[^\]]*\]|\S+)$", job)
-    return set(re.findall(r"[a-z][a-z-]*", m.group(1))) if m else set()
+def _stages(job: dict) -> set:
+    runs = "\n".join(str(s.get("run", "")) for s in job.get("steps") or [])
+    assert ("bot.cli" in runs or "bot/cli" in runs) <= bool(INVOKE.search(runs)), \
+        f"a bot invocation this test cannot read: {runs!r}"
+    return set(INVOKE.findall(runs))
 
 
-def _reporting(jobs: dict) -> dict:
-    return {n: j for n, j in jobs.items() if set(STAGE.findall(j)) - NOT_REPORTING}
+def _needs(job: dict) -> list:
+    n = job.get("needs") or []
+    return [n] if isinstance(n, str) else list(n)
 
 
-def _ancestors(jobs: dict, name: str) -> set:
-    seen, todo = set(), list(_needs(jobs[name]))
-    while todo:
-        n = todo.pop()
-        if n not in seen:
-            seen.add(n)
-            todo += _needs(jobs[n])
-    return seen
+def _reporting(flow: dict) -> dict:
+    return {n: j for n, j in (flow.get("jobs") or {}).items() if _stages(j) - NOT_REPORTING}
 
 
-def _if(job: str) -> str:
-    m = re.search(r"(?ms)^    if: (.*?)(?=^    [a-z-]+:)", job)
-    return " ".join(m.group(1).split()) if m else ""
+def test_only_release_yml_invokes_a_reporting_stage():
+    assert [name for name, flow in _flows().items() if _reporting(flow)] == ["release.yml"]
 
 
-def _runs_only_after_plan_ran(jobs: dict, name: str) -> bool:
-    """`plan` itself, a job that needs plan's own go-ahead or release's success, a job with the
-    default `success()` gate under plan, or recover, which fires only in `recover` mode or on a
-    failed or cancelled stage (and in `finish` mode every stage it needs is skipped)."""
-    cond = _if(jobs[name])
-    if name == "plan" or "needs.plan.outputs.proceed == 'true'" in cond or RELEASE_EXCLUSIVE in cond:
-        return True
-    if name == "recover":
-        results = re.findall(r"needs\.[a-z]+\.result == '([a-z]+)'", cond)
-        return ("inputs.mode == 'recover'" in cond and results
-                and set(results) <= {"failure", "cancelled"})
-    return "always()" not in cond and "!cancelled()" not in cond and "plan" in _ancestors(jobs, name)
+def test_the_release_workflow_is_one_uncancelled_group_that_no_job_overrides():
+    flow = _flows()["release.yml"]
+    assert flow["concurrency"] == {"group": "release", "cancel-in-progress": False}
+    assert [n for n, j in flow["jobs"].items() if "concurrency" in j] == []
 
 
-def test_only_release_yml_runs_a_stage_that_reports():
-    running = [w.name for w in WORKFLOWS if set(STAGE.findall(w.read_text())) - NOT_REPORTING]
-    assert running == ["release.yml"]
-
-
-def test_the_whole_release_workflow_is_one_uncancelled_group_no_job_overrides():
-    text = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-    assert re.search(r"(?m)^concurrency:\n  group: release\n  cancel-in-progress: false\b", text)
-    assert text.count("concurrency:") == 1, "a job-level group would let that job run beside a run"
-
-
-# Pairs of reporting jobs that are not ordered by `needs`, and why both can never run in one run.
-MODE_EXCLUSIVE = ("inputs.mode == 'finish'", "(inputs.mode || 'full') == 'full'")
-RELEASE_EXCLUSIVE = "needs.release.result == 'success'"
-
-
-def test_two_reporting_jobs_of_one_run_never_run_side_by_side():
-    jobs = _jobs((ROOT / ".github" / "workflows" / "release.yml").read_text())
-    rep = _reporting(jobs)
-    assert set(rep) >= {"plan", "recover", "finish-integrate"}
-    for a, b in combinations(sorted(rep), 2):
-        if a in _ancestors(jobs, b) or b in _ancestors(jobs, a):
-            continue
-        ia, ib = _if(rep[a]), _if(rep[b])
-        finish = [n for n, i in ((a, ia), (b, ib)) if n.startswith("finish-")]
-        if len(finish) == 1:
-            # A finish job runs only in `finish` mode; the other chain's root, `plan`, never does.
-            other = b if finish[0] == a else a
-            assert MODE_EXCLUSIVE[0] in _if(rep[finish[0]])
-            assert MODE_EXCLUSIVE[1] in _if(jobs["plan"]) and "finish" not in _if(jobs["plan"])
-            assert _runs_only_after_plan_ran(jobs, other), f"{other} could run in finish mode"
-            continue
-        # The only other unordered pairs: recover beside the post-release chain. The chain needs
-        # release to have SUCCEEDED; recover runs only when release (or a stage before it)
-        # failed or was cancelled, or in `recover` mode, where plan, and so release, never run.
-        pair = {a, b}
-        assert "recover" in pair, f"{a} and {b} could run side by side"
-        chain = (pair - {"recover"}).pop()
-        assert "release" in _ancestors(jobs, chain) and RELEASE_EXCLUSIVE in _if(rep[chain])
-        rec = _if(rep["recover"])
-        assert "needs.release.result == 'success'" not in rec and "always()" in rec
-        assert "recover" not in _if(jobs["plan"])
+def test_the_reporting_jobs_and_their_conditions_are_exactly_the_reviewed_ones():
+    rep = _reporting(_flows()["release.yml"])
+    assert sorted(rep) == sorted(EXPECTED)
+    for name, (needs, cond) in EXPECTED.items():
+        assert _needs(rep[name]) == needs, name
+        assert " ".join(str(rep[name].get("if", "")).split()) == cond, name
 
 
 @pytest.mark.parametrize("stage", sorted(NOT_REPORTING))
-def test_web_and_heartbeat_return_before_the_report_path(monkeypatch, stage):
+@pytest.mark.parametrize("error", [cli.Stop("x", "boom", "nothing"), RuntimeError("boom")],
+                         ids=["stop", "unexpected"])
+def test_web_and_heartbeat_return_before_the_report_path(monkeypatch, stage, error):
     reported = []
     monkeypatch.setattr(cli, "_report_stop", lambda ctx, stop: reported.append(stop))
 
-    def stops(*a, **k):
-        raise cli.Stop(stage, "boom", "nothing")
-    monkeypatch.setattr(cli, f"stage_{stage}", stops)
-    with pytest.raises(cli.Stop):
+    def fails(*a, **k):
+        raise error
+    monkeypatch.setattr(cli, f"stage_{stage}", fails)
+    with pytest.raises(type(error)):
         cli.main([stage])
     assert reported == []
 
 
-def test_the_report_path_is_reached_only_from_main():
-    calls = [ln for p in sorted((ROOT / "bot").glob("*.py"))
-             for ln in p.read_text().splitlines() if "_report_stop(" in ln and "def " not in ln]
-    assert len(calls) == 3                       # Stop, Unreadable, anything else: all in main
+def test_an_unexpected_error_in_a_stage_takes_the_generic_report_and_is_raised(monkeypatch):
+    reported = []
+    monkeypatch.setattr(cli, "_report_stop", lambda ctx, stop: reported.append(stop))
+    monkeypatch.setattr(cli, "report_retry_outcome", lambda ctx, text: None)
+
+    def fails(ctx):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(cli, "stage_plan", fails)
+    with pytest.raises(RuntimeError):
+        cli.main(["plan"])
+    assert len(reported) == 1 and "unexpected RuntimeError" in reported[0].observed
+    assert reported[0].code == "", "an unnamed cause is never merged"
+
+
+def test_every_report_call_is_in_main():
+    callers = []
+    for path in sorted((ROOT / "bot").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
+                name = getattr(call.func, "id", getattr(call.func, "attr", ""))
+                if name == "_report_stop":
+                    callers.append((path.name, fn.name))
+    assert callers == [("cli.py", "main")] * 3
