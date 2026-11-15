@@ -89,11 +89,14 @@ class Stop(RuntimeError):
     """A refusal with a reason fit to put in an issue."""
 
     def __init__(self, stage: str, observed: str, next_action: str, detail: str = "",
-                 findings=()):
+                 findings=(), code: str = ""):
         super().__init__(f"{stage}: {observed}")
         self.stage, self.observed, self.next_action, self.detail = (
             stage, observed, next_action, detail)
         self.findings = list(findings)
+        # The reason, as a fixed word, on the stops that recur before any attempt exists. With it a
+        # repeated stop reports into one open issue per stage, version and reason (`_stop_key`).
+        self.code = code
 
 
 def git(*args, cwd=None, check=True) -> str:
@@ -125,6 +128,7 @@ class Ctx:
                         if self.run_id != "local" else "(local run)")
         # A repair or a recovery works on ANOTHER run's attempt, named on the dispatch.
         self.attempt_id = os.environ.get("ATTEMPT_RUN_ID", "").strip() or self.run_id
+        self.version = ""           # the version the plan computed; part of a stop's issue key
         self.work = Path(tempfile.mkdtemp(prefix="release-bot-"))
 
     # -- the attempt issue is the durable record ------------------------------------------
@@ -337,7 +341,8 @@ def _findings(ctx: Ctx, manifest_text: str, policy: dict, dev_manifest_text: str
         raise Stop("watch", "policy.toml and the manifest disagree:\n\n"
                    + "\n".join(f"- {g}" for g in gaps),
                    "Add the missing rule (or drop the stale one) in policy.toml, then re-run. "
-                   "A pin with no rule is never moved by a rule nobody wrote.")
+                   "A pin with no rule is never moved by a rule nobody wrote.",
+                   code="policy-manifest-gap")
     remote = up.Remote(ctx.work / "upstream", token=ctx.token)
     found = [up.examine(s, policy["source"][s.path], remote) for s in sources]
     current = {"graywolf": mf.graywolf_version(manifest_text),
@@ -463,25 +468,27 @@ def stage_plan(ctx: Ctx) -> int:
     stops cheaply."""
     if not ctx.token:
         raise Stop("observe", "AUTO_RELEASE_TOKEN is not set.",
-                   "Add the release token as a repository secret of this repo.")
+                   "Add the release token as a repository secret of this repo.",
+                   code="token-missing")
     try:
         who = ctx.gh.whoami().get("login", "?")
     except GitHubError as exc:
         raise Stop("observe", f"the release token cannot authenticate: {exc}",
-                   "Rotate AUTO_RELEASE_TOKEN and re-run.") from None
+                   "Rotate AUTO_RELEASE_TOKEN and re-run.", code="token-auth") from None
     expiry = ctx.gh.token_expiry()
     budget = _credential_problem(expiry, ctx.mode)
     if budget:
         raise Stop("observe", budget,
                    "Rotate AUTO_RELEASE_TOKEN. Read-only modes (`watch-only`, `dry-run`) run "
                    "regardless — only a run that may publish is refused for want of time to "
-                   "finish and, if needed, undo itself.")
+                   "finish and, if needed, undo itself.", code="token-budget")
     for repo in (LHPC, BIN, IMG):                       # probe, do not assume
         try:
             ctx.gh.get(f"/repos/{repo}/actions/workflows")
         except GitHubError as exc:
             raise Stop("observe", f"the release token cannot reach {repo}: {exc}",
-                       "Check the token's repository access and Actions permission.") from None
+                       "Check the token's repository access and Actions permission.",
+                       code="token-reach") from None
     print(f"authenticated as {who}; token expiry: {expiry or 'none'}")
 
     if ctx.mode == "full":
@@ -505,7 +512,7 @@ def stage_plan(ctx: Ctx) -> int:
                        "an earlier attempt is unresolved:\n\n" + "\n".join(lines),
                        "Finish it (`finish`) or undo it (`recover`) before starting another "
                        "release. Starting one now could make that attempt's image impossible to "
-                       "cut, because the image builder resolves `main`.")
+                       "cut, because the image builder resolves `main`.", code="attempt-unresolved")
 
     lhpc = ctx.clone(LHPC, base_ref())
     base_sha = git("rev-parse", "HEAD", cwd=lhpc)
@@ -524,7 +531,7 @@ def stage_plan(ctx: Ctx) -> int:
                    + "\n".join(f"- `{f.key}`: {f.detail}" for f in faults),
                    "Fix the upstream situation (an orphaned pin, a rewritten branch, an "
                    "unreachable remote) or adjust policy.toml, then re-run.",
-                   findings=found)
+                   findings=found, code="input-unjudged")
 
     ctx.summary(rp.summary(found, "No pin has moved" if not moved else
                            f"{len(moved)} pin(s) to move"))
@@ -545,12 +552,13 @@ def stage_plan(ctx: Ctx) -> int:
     # The version check is validation too: a move that cannot be released must not spend a claim.
     current = cl.current_version((lhpc / "pyproject.toml").read_text())
     version = cl.next_patch(current)
+    ctx.version = version
     problems = tag_problems(ctx, current, version, base_sha) if moved else []
     if problems:
         raise Stop("plan", f"version {version} cannot be released from this `main`:\n\n"
                    + "\n".join(f"- {p}" for p in problems),
                    "Nothing was pushed. Tag main's version on main (or move `main` past the "
-                   "taken tag), then re-run.")
+                   "taken tag), then re-run.", code="version-taken")
     _check_parent(ctx, [f for f in found if f.status == "frozen"])
     _claim_the_retry(ctx)
 
@@ -576,11 +584,12 @@ def stage_plan(ctx: Ctx) -> int:
             if verdict == "failed":
                 raise Stop("plan", "the held baseline did not pass.",
                            "Nothing was released. The hold stands; the composition it retains "
-                           "is itself failing, so investigate before thawing.")
+                           "is itself failing, so investigate before thawing.", code="baseline-red")
             if verdict == "unproven":
                 raise Stop("plan", "the held baseline could not be proved at all.",
                            "Nothing was released and nothing was measured, so the retry is "
-                           "still owed. Settle the parent by hand or re-run it.")
+                           "still owed. Settle the parent by hand or re-run it.",
+                           code="baseline-unproved")
         ctx.out(proceed="false")
         return 0
 
@@ -603,7 +612,8 @@ def stage_plan(ctx: Ctx) -> int:
         # produce a candidate whose manifest LHPC refuses to load.
         raise Stop("plan", f"this manifest cannot carry the move: {exc}",
                    "The controller on `main` predates the recorded build inputs. Release the "
-                   "controller change that adds them first; the pin move is then ordinary.")            from None
+                   "controller change that adds them first; the pin move is then ordinary.",
+                   code="manifest-cannot-carry")            from None
     manifest_p.write_text(text)
 
     bullets = cl.pin_bullets(moved)
@@ -621,7 +631,8 @@ def stage_plan(ctx: Ctx) -> int:
     if check.returncode != 0:
         raise Stop("prepare", f"the edited manifest fails LHPC's own pin contract:\n\n```\n"
                    f"{check.stderr.strip()[:1000]}\n```",
-                   "Nothing was pushed. Fix the edit rule in `bot/manifest.py`.")
+                   "Nothing was pushed. Fix the edit rule in `bot/manifest.py`.",
+                   code="pin-contract")
     # LHPC's own Python pins (bot/pins_check.py): checked here, before anything is pushed.
     try:
         clock = pins.Clock()                       # one bound for both checks
@@ -637,7 +648,8 @@ def stage_plan(ctx: Ctx) -> int:
     except mf.Unreadable as exc:
         raise Stop("plan", f"the candidate's binary index: {exc}",
                    "Nothing was pushed. Every [stack.binary] index_url must name the same "
-                   "index.json or index-v3.json of lhpc-binaries' `binaries` release.") from None
+                   "index.json or index-v3.json of lhpc-binaries' `binaries` release.",
+                   code="candidate-index") from None
     ctx.summary(f"binary index: `{binary_index}`")
     # Decided BEFORE the dry-run exit, so a dry run shows which binaries the move republishes.
     need = binary_rebuilds(mf.binary_stacks(manifest_p.read_text()),
@@ -2693,12 +2705,13 @@ def _opening(ctx: Ctx) -> str:
 
 def _report_stop(ctx: Ctx, stop: Stop) -> None:
     """Always produce a report. Everything that could fail on the way is optional."""
-    att, number = Attempt(run_id=ctx.attempt_id), 0
+    att, number, looked = Attempt(run_id=ctx.attempt_id), 0, True
     try:
         found_number, found = ctx.find_attempt(ctx.attempt_id)
         if found:
             att, number = found, found_number
     except Exception as exc:                                       # noqa: BLE001
+        looked = False
         stop.detail = (stop.detail + f"\n\n_the attempt record could not be read: {exc}_")
     expiry = ""
     try:
@@ -2718,15 +2731,50 @@ def _report_stop(ctx: Ctx, stop: Stop) -> None:
         token_expiry=expiry, opening=_opening(ctx))
     ctx.summary(f"## Stopped at {stop.stage}\n\n{observed}\n\n{stop.next_action}")
     try:
-        marker = f"<!--auto-release:{att.run_id or ctx.run_id}-->"
-        existing = [i for i in ctx.bot_gh.open_issues(BOT, "auto-release")
-                    if marker in (i.get("body") or "")]
-        if existing:
-            ctx.bot_gh.comment(BOT, existing[0]["number"], body + f"\n{marker}\n")
-        else:
-            ctx.bot_gh.create_issue(BOT, title, body + f"\n{marker}\n", ["auto-release"])
+        key = (_stop_key(ctx, stop) if looked and not number and ctx.attempt_id == ctx.run_id
+               else "")
+        _file_report(ctx, f"<!--auto-release:{key or att.run_id or ctx.run_id}-->", title, body)
     except Exception as exc:                                       # noqa: BLE001
         print(f"could not open the failure issue: {exc}", file=sys.stderr)
+
+
+def _stop_key(ctx: Ctx, stop: Stop) -> str:
+    """The issue key of a stop CONFIRMED to belong to no attempt: one open issue per stage, version
+    and reason, so a release blocked every week is one issue with a comment per run. A stop without
+    a reason code gets "" and keeps its run's own issue: a cause nobody named is never merged.
+
+    The caller asks only when the record lookup succeeded, found nothing, and the dispatch named no
+    attempt. A lookup that failed, or a named attempt, keeps the attempt's run id: a stop that may
+    belong to an attempt must stay on that attempt's issue."""
+    if not stop.code:
+        return ""
+    return f"stop:{stop.stage}:{ctx.version or '-'}:{stop.code}"
+
+
+def _file_report(ctx: Ctx, marker: str, title: str, body: str) -> None:
+    """Report into the ONE open issue carrying `marker`: a comment on it, or a new issue.
+
+    One release run runs at a time (release.yml's concurrency group), so two reports of one key
+    do not normally race. If they do, both looked before either created: the look after the
+    create finds both, the oldest stays, and the newer is closed as its duplicate."""
+    text = body + f"\n{marker}\n"
+
+    def holders() -> list:
+        return sorted(i["number"] for i in ctx.bot_gh.open_issues(BOT, "auto-release")
+                      if marker in (i.get("body") or ""))
+
+    found = holders()
+    if found:
+        ctx.bot_gh.comment(BOT, found[0], text)
+        return
+    own = ctx.bot_gh.create_issue(BOT, title, text, ["auto-release"])["number"]
+    found = holders()
+    if found and found[0] != own:
+        ctx.bot_gh.comment(BOT, found[0], text)
+    for number in found[1:]:
+        ctx.bot_gh.comment(BOT, number, f"Duplicate of #{found[0]}: two runs reported the same "
+                                        "stop at once; the oldest issue carries the reports.")
+        ctx.bot_gh.update_issue(BOT, number, state="closed")
 
 
 if __name__ == "__main__":

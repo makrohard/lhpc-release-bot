@@ -146,3 +146,133 @@ def test_an_expiring_incident_promises_renewal_only_on_an_attributable_regressio
                        until="2026-10-23")
     assert "attributable regression that holds them again renews" in body
     assert "an unmarked red leaves it expired" in body and "a red one renews" not in body
+
+
+# ---- one open issue per problem: a stop with no attempt, by stage, version and reason ----
+
+class _StopStore(_Store):
+    """`_Store`, plus a list that can lag: `hide` issue numbers stay invisible to the next
+    `open_issues` call, the way a second run's issue is invisible to a run that already looked."""
+
+    def __init__(self):
+        super().__init__()
+        self.hide = set()
+
+    def open_issues(self, repo, label):
+        seen = [i for i in super().open_issues(repo, label) if i["number"] not in self.hide]
+        self.hide = set()
+        return seen
+
+
+class _StopCtx:
+    run_url, token = "https://example.invalid/run/9", ""
+
+    def __init__(self, store, run_id="9", attempt_id="", version="", record=None, lookup=None):
+        self.bot_gh, self.gh, self.retry_of = store, None, ""
+        self.run_id, self.attempt_id, self.version = run_id, attempt_id or run_id, version
+        self._record, self._lookup = record, lookup
+
+    def find_attempt(self, wanted=""):
+        if self._lookup:
+            raise self._lookup
+        return (3, self._record) if self._record else (0, None)
+
+    def summary(self, text):
+        pass
+
+
+def _plan_stop(code="version-taken"):
+    return cli.Stop("plan", "version 0.12.11 cannot be released from this `main`",
+                    "Tag main's version on main, then re-run.", code=code)
+
+
+def _open(store):
+    return {n: i for n, i in store.issues.items() if i["state"] == "open"}
+
+
+def test_two_runs_stopped_for_the_same_reason_share_one_issue():
+    store = _StopStore()
+    cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
+    cli._report_stop(_StopCtx(store, "102", version="0.12.11"), _plan_stop())
+    assert list(_open(store)) == [1]
+    assert "<!--auto-release:stop:plan:0.12.11:version-taken-->" in store.issues[1]["body"]
+    assert len(store.notes[1]) == 1 and "/run/9" in store.notes[1][0]
+
+
+def test_another_version_or_another_reason_is_another_issue():
+    store = _StopStore()
+    cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
+    cli._report_stop(_StopCtx(store, "102", version="0.12.12"), _plan_stop())
+    cli._report_stop(_StopCtx(store, "103", version="0.12.12"), _plan_stop("baseline-red"))
+    assert list(_open(store)) == [1, 2, 3] and not any(store.notes.values())
+
+
+def test_the_blocked_release_stop_is_keyed_as_observe_with_no_version():
+    from tests.test_attempt import _PlanCtx
+    blocker = Attempt(run_id="4000", state="mutated", version="0.12.10", base_sha="b" * 40,
+                      candidate_sha="c" * 40, branch="pins/0.12.10-4000", dispatched=["meshcom"])
+    with pytest.raises(cli.Stop) as raised:
+        cli.stage_plan(_PlanCtx(blocker))
+    store = _StopStore()
+    for run in ("201", "202"):
+        cli._report_stop(_StopCtx(store, run), raised.value)
+    assert list(_open(store)) == [1] and len(store.notes[1]) == 1
+    assert "<!--auto-release:stop:observe:-:attempt-unresolved-->" in store.issues[1]["body"]
+    other = cli.Stop("observe", "the release token cannot authenticate", "Rotate.",
+                     code="token-auth")
+    cli._report_stop(_StopCtx(store, "203"), other)
+    assert list(_open(store)) == [1, 2], "another reason never joins the blocked issue"
+
+
+def test_the_untagged_version_stop_carries_the_version_the_plan_computed(tmp_path, monkeypatch):
+    from tests.test_changelog import _tagged_plan
+    stop, ctx = _tagged_plan(tmp_path, monkeypatch, {})
+    assert stop.code == "version-taken" and ctx.version == "0.12.11"
+    store = _StopStore()
+    cli._report_stop(_StopCtx(store, "101", version=ctx.version), stop)
+    assert "<!--auto-release:stop:plan:0.12.11:version-taken-->" in store.issues[1]["body"]
+
+
+def test_a_stop_whose_attempt_could_not_be_looked_up_is_never_merged():
+    store = _StopStore()
+    cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
+    cli._report_stop(_StopCtx(store, "102", version="0.12.11", lookup=RuntimeError("HTTP 502")),
+                     _plan_stop())
+    assert list(_open(store)) == [1, 2] and not store.notes[1]
+    assert "<!--auto-release:102-->" in store.issues[2]["body"]
+
+
+def test_a_stop_that_found_its_attempt_or_names_one_keeps_the_attempt_issue():
+    store = _StopStore()
+    record = Attempt(run_id="777", state="prepared", version="0.12.11", base_sha="b" * 40,
+                     candidate_sha="c" * 40, branch="pins/0.12.11-777")
+    cli._report_stop(_StopCtx(store, "777", version="0.12.11", record=record), _plan_stop())
+    cli._report_stop(_StopCtx(store, "778", attempt_id="555"), _plan_stop())
+    assert "<!--auto-release:777-->" in store.issues[1]["body"]
+    assert "<!--auto-release:555-->" in store.issues[2]["body"]
+
+
+def test_a_stop_without_a_reason_code_keeps_its_own_run_issue():
+    store = _StopStore()
+    for run in ("101", "102"):
+        cli._report_stop(_StopCtx(store, run, version="0.12.11"), _plan_stop(code=""))
+    assert list(_open(store)) == [1, 2]
+    assert "<!--auto-release:102-->" in store.issues[2]["body"]
+
+
+def test_a_closed_issue_is_not_reopened_by_comment():
+    store = _StopStore()
+    cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
+    store.update_issue("bot", 1, state="closed")
+    cli._report_stop(_StopCtx(store, "102", version="0.12.11"), _plan_stop())
+    assert list(_open(store)) == [2] and not store.notes[1]
+
+
+def test_two_runs_that_race_leave_one_open_issue_the_oldest():
+    store = _StopStore()
+    cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
+    store.hide = {1}                     # the second run looked before the first one's issue
+    cli._report_stop(_StopCtx(store, "102", version="0.12.11"), _plan_stop())
+    assert list(_open(store)) == [1], "the newer issue is closed as the duplicate"
+    assert any("/run/9" in n for n in store.notes[1]), "its report went to the oldest"
+    assert store.notes[2] and "Duplicate of #1" in store.notes[2][-1]
