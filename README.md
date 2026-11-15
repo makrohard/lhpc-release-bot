@@ -123,6 +123,13 @@ the channel's typed message and offered the source build. Installed boxes are un
   run's failing jobs with the last lines of their logs). It lives here rather than in the controller so that a
   run whose release credential is the thing that failed can still report; this repository's own
   `GITHUB_TOKEN` writes it. Diagnostics are best-effort; the rest is never omitted.
+  A stop of an attempt reports into that attempt's issue. A stop that belongs to no attempt and
+  has a named reason (an unresolved earlier attempt, an untagged version, a token problem, ...)
+  reports into ONE open issue per stage, version and reason: later runs add a comment. Only one
+  release run runs at a time (the workflow's `release` concurrency group, pinned by
+  tests/test_one_reporter.py), so two reports never race; should duplicates exist anyway (an
+  issue opened by hand, an interrupted cleanup), the next report keeps the lowest-numbered one
+  and closes the others as its duplicates.
 - **Something keeps not working, without failing:** one issue labelled `degraded` per state — a
   source skipped as unreachable (`degraded source: <key>`), or a test-lab gate left unproven by an
   external outage (`degraded gate: <job>`, closed only by a run in which that job succeeded), or
