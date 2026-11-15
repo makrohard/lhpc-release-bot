@@ -97,6 +97,8 @@ class Stop(RuntimeError):
         # The reason, as a fixed word, on the stops that recur before any attempt exists. With it a
         # repeated stop reports into one open issue per stage, version and reason (`_stop_key`).
         self.code = code
+        # Set by `_recover_stop` when this outcome is the one already reported for the attempt.
+        self.unchanged = False
 
 
 def git(*args, cwd=None, check=True) -> str:
@@ -2135,6 +2137,20 @@ def _replaced(stack: str, live: dict, snapshot: dict) -> str:
                            for k in gone)
 
 
+def _recover_stop(ctx: Ctx, number: int, att: Attempt, note: str, stop: Stop) -> Stop:
+    """End a recovery that cannot finish. The note goes into the record and the stop is reported
+    only when this outcome differs from the one last reported for the attempt: every scheduled
+    run re-recovers a blocked attempt, and the same outcome said each run is noise. The run is
+    red either way, and its job summary says why."""
+    if note == att.last_report:
+        stop.unchanged = True
+    else:
+        att.notes.append(note)
+        att.last_report = note
+        ctx.save_attempt(number, att)
+    return stop
+
+
 def _withdraw_unproven(ctx: Ctx, number: int, att: Attempt, live: dict) -> dict:
     """An attempt that is NOT proven (`prove_verdict`) takes its own live index-v3 entries out
     (rollback-binary `withdraw-v3`, recorded as `rollback`), and the index is read back. Returns
@@ -2146,14 +2162,14 @@ def _withdraw_unproven(ctx: Ctx, number: int, att: Attempt, live: dict) -> dict:
     owned = {s: own_entry(att, s, live.get(s)) for s in att.dispatched}
     legacy = sorted(s for s, (e, old) in owned.items() if old)
     if legacy:
-        att.notes.append("recovery stopped: the live entry of " + ", ".join(legacy)
-                         + " matches this attempt's build but names no build_run")
-        ctx.save_attempt(number, att)
-        raise Stop("recover", "this attempt is not proven, and its build of " + ", ".join(legacy)
-                   + " is live without the run that published it (published before "
-                   "`build_run`), so it cannot be told from somebody else's.",
-                   "Nothing was withdrawn. The attempt stays open; withdraw the entry by hand "
-                   "(rollback-binary, mode withdraw-v3) or keep it, then settle the attempt.")
+        raise _recover_stop(ctx, number, att, (
+            "recovery stopped: the live entry of " + ", ".join(legacy)
+            + " matches this attempt's build but names no build_run"), Stop(
+            "recover", "this attempt is not proven, and its build of " + ", ".join(legacy)
+            + " is live without the run that published it (published before `build_run`), so it "
+            "cannot be told from somebody else's.",
+            "Nothing was withdrawn. The attempt stays open; withdraw the entry by hand "
+            "(rollback-binary, mode withdraw-v3) or keep it, then settle the attempt."))
     keys = {s: [entry_key(e)] for s, (e, _) in owned.items() if e}
     if not keys:
         return live
@@ -2163,20 +2179,19 @@ def _withdraw_unproven(ctx: Ctx, number: int, att: Attempt, live: dict) -> dict:
     ctx.save_attempt(number, att)
     run = ctx.gh.wait(BIN, rb, BOUNDS["settle"], poll_s=15, rerun=False)
     if run.get("conclusion") != "success":
-        att.notes.append(f"WITHDRAWAL NOT CONFIRMED: {run.get('html_url')}")
-        ctx.save_attempt(number, att)
-        raise Stop("recover", "this attempt's unproven binaries could not be withdrawn from "
-                   "index-v3.json.", "The attempt stays open and blocks new releases. Inspect "
-                   "the rollback run, then re-run `recover`.", detail=run.get("html_url", ""))
+        raise _recover_stop(ctx, number, att, f"WITHDRAWAL NOT CONFIRMED: {run.get('html_url')}",
+                            Stop("recover", "this attempt's unproven binaries could not be "
+                                 "withdrawn from index-v3.json.", "The attempt stays open and "
+                                 "blocks new releases. Inspect the rollback run, then re-run "
+                                 "`recover`.", detail=run.get("html_url", "")))
     live = _live_index(ctx, att.binary_index).get("stacks", {})
     still = sorted(s for s, k in keys.items() if k[0] in [entry_key(e) for e in live.get(s) or []])
     if still:
-        att.notes.append("withdrawal reported success but the index still holds "
-                         + ", ".join(still))
-        ctx.save_attempt(number, att)
-        raise Stop("recover", "the index read back still holds this attempt's entry for "
-                   + ", ".join(still) + ".", "The attempt stays open. Inspect the rolling "
-                   "release by hand.")
+        raise _recover_stop(ctx, number, att, (
+            "withdrawal reported success but the index still holds " + ", ".join(still)), Stop(
+            "recover", "the index read back still holds this attempt's entry for "
+            + ", ".join(still) + ".", "The attempt stays open. Inspect the rolling release by "
+            "hand."))
     att.notes.append("withdrawn, not proven: " + ", ".join(
         f"{s} {k[0][0]}" for s, k in sorted(keys.items())))
     ctx.save_attempt(number, att)
@@ -2228,12 +2243,12 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
                     f"{', '.join(att.owes) or 'nothing'}.")
         return 0
     if decision == "conflict":
-        att.notes.append(f"recovery stopped: {tag} exists at {tag_sha[:9]}, not at this "
-                         f"attempt's candidate {att.candidate_sha[:9]}")
-        ctx.save_attempt(number, att)
-        raise Stop("recover", f"the version {att.version} is held by a different commit.",
-                   "This attempt stays open. Somebody else released that version; decide by "
-                   "hand what should happen to this attempt's candidate.")
+        raise _recover_stop(ctx, number, att, (
+            f"recovery stopped: {tag} exists at {tag_sha[:9]}, not at this attempt's candidate "
+            f"{att.candidate_sha[:9]}"), Stop(
+            "recover", f"the version {att.version} is held by a different commit.",
+            "This attempt stays open. Somebody else released that version; decide by hand what "
+            "should happen to this attempt's candidate."))
 
     # ---- settle every writer this attempt started, BEFORE touching anything -------------
     unsettled = []
@@ -2257,13 +2272,12 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
         if run.get("timed_out") or run.get("status") != "completed":
             unsettled.append(f"{name} (run {rid}) is still running")
     if unsettled:
-        att.notes.append("recovery could not settle: " + "; ".join(unsettled))
-        ctx.save_attempt(number, att)
-        raise Stop("recover", "a publisher this attempt started has not stopped:\n\n"
-                   + "\n".join(f"- {u}" for u in unsettled),
-                   "The attempt stays open and keeps blocking new releases. Rolling the index "
-                   "back while that job can still write would undo the rollback. Re-run "
-                   "`recover` once it is terminal.")
+        raise _recover_stop(ctx, number, att, "recovery could not settle: " + "; ".join(unsettled),
+                            Stop("recover", "a publisher this attempt started has not stopped:\n\n"
+                                 + "\n".join(f"- {u}" for u in unsettled),
+                                 "The attempt stays open and keeps blocking new releases. Rolling "
+                                 "the index back while that job can still write would undo the "
+                                 "rollback. Re-run `recover` once it is terminal."))
 
     # ---- reconcile every stack a publish was STARTED for --------------------------------
     live = _live_index(ctx, att.binary_index).get("stacks", {})
@@ -2299,12 +2313,12 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
                "unknown")
 
     if conflicts:
-        att.notes.append(f"recovery stopped ({att.binary_index}): the live entry for "
-                         + ", ".join(conflicts) + " is not one this attempt may leave or restore")
-        ctx.save_attempt(number, att)
-        raise Stop("recover", f"the binary index ({att.binary_index}) holds an entry this "
-                   f"attempt cannot claim:\n\n" + "\n".join(f"- {c}" for c in conflicts),
-                   f"Nothing was changed: {why}. The attempt stays open for inspection.")
+        raise _recover_stop(ctx, number, att, (
+            f"recovery stopped ({att.binary_index}): the live entry for {', '.join(conflicts)} is "
+            "not one this attempt may leave or restore"), Stop(
+            "recover", f"the binary index ({att.binary_index}) holds an entry this attempt cannot "
+            "claim:\n\n" + "\n".join(f"- {c}" for c in conflicts),
+            f"Nothing was changed: {why}. The attempt stays open for inspection."))
 
     if restore:
         stacks = ",".join(sorted(restore))
@@ -2322,20 +2336,19 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
         ctx.save_attempt(number, att)
         run = ctx.gh.wait(BIN, rb, BOUNDS["settle"], poll_s=15, rerun=False)
         if run.get("conclusion") != "success":
-            att.notes.append(f"ROLLBACK NOT CONFIRMED: {run.get('html_url')}")
-            ctx.save_attempt(number, att)
-            raise Stop("recover", "the binary index could not be restored.",
-                       "This attempt stays open and blocks new releases. Inspect the rollback "
-                       "run, then re-run `recover`.", detail=run.get("html_url", ""))
+            raise _recover_stop(ctx, number, att, f"ROLLBACK NOT CONFIRMED: {run.get('html_url')}",
+                                Stop("recover", "the binary index could not be restored.",
+                                     "This attempt stays open and blocks new releases. Inspect the "
+                                     "rollback run, then re-run `recover`.",
+                                     detail=run.get("html_url", "")))
         back = _live_index(ctx, att.binary_index).get("stacks", {})
         wrong = [s for s in restore if _canon(back.get(s)) != _canon(snapshot.get(s))]
         if wrong:
-            att.notes.append("rollback reported success but the index still differs for "
-                             + ", ".join(wrong))
-            ctx.save_attempt(number, att)
-            raise Stop("recover", "the index read back is not the snapshot for "
-                       + ", ".join(wrong) + ".",
-                       "This attempt stays open. Inspect the rolling release by hand.")
+            raise _recover_stop(ctx, number, att, (
+                "rollback reported success but the index still differs for " + ", ".join(wrong)),
+                Stop("recover", "the index read back is not the snapshot for "
+                     + ", ".join(wrong) + ".",
+                     "This attempt stays open. Inspect the rolling release by hand."))
         att.notes.append(f"index restored for {stacks}")
     if noop:
         att.notes.append(("left in the history (a new composition, or nothing published): "
@@ -2662,6 +2675,10 @@ def main(argv=None) -> int:
                 "release": stage_release, "integrate": stage_integrate,
                 "image": stage_image, "finalize": stage_finalize}[args.stage](ctx)
     except Stop as stop:
+        if stop.unchanged:
+            ctx.summary(f"## Stopped at {stop.stage} (unchanged, already reported)\n\n"
+                        f"{stop.observed}\n\n{stop.next_action}")
+            return 1
         report_retry_outcome(ctx, f"stopped at {stop.stage} — {stop.observed}")
         _report_stop(ctx, stop)
         return 1

@@ -6,6 +6,10 @@ Milestones only.
 
 - A run blocked by an unresolved attempt recovers the oldest one itself; one that cannot be settled
   provably (e.g. an unrecorded publisher) stays open, so the scheduled run stays red until settled.
+- A recovery that stops the same way again (every scheduled run re-recovers a blocked attempt)
+  adds no note and no comment: only a changed outcome is reported. The run stays red and its job
+  summary says why. Upgrade: attempt records gain `last_report`; a bot older than this cannot
+  read a record that has it, so do not roll the bot back past this while an attempt is open.
 - Recovery never settles a publish whose run id was lost (the attempt stays open); a release is
   recorded only when `main` and the tag both name the candidate, whatever the push answered.
 - Recovery withdraws an unproven attempt's own binaries from index-v3.json (installed copies stay);
