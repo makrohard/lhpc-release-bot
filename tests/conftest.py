@@ -7,4 +7,5 @@ from bot import cli
 
 @pytest.fixture(autouse=True)
 def _in_the_release_workflow(monkeypatch):
-    monkeypatch.setenv("GITHUB_WORKFLOW", cli.REPORTING_WORKFLOW)
+    monkeypatch.setenv("GITHUB_WORKFLOW_REF",
+                       f"{cli.BOT}/.github/workflows/{cli.RELEASE_WORKFLOW}@refs/heads/main")

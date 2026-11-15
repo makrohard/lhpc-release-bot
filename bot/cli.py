@@ -65,10 +65,6 @@ def base_ref() -> str:
     return os.environ.get("LHPC_REF", "").strip() or "main"
 
 RELEASE_WORKFLOW = "release.yml"
-# The `name:` of release.yml, which GitHub hands every job as GITHUB_WORKFLOW. Only that workflow
-# files stop reports: its one `release` concurrency group lets one run at a time, so two reports
-# of one key never race (tests/test_one_reporter.py pins the group).
-REPORTING_WORKFLOW = "release"
 MANIFEST = "lhpc/data/manifest.example.toml"
 BOT_URL = "https://github.com/" + BOT
 
@@ -2734,11 +2730,11 @@ def _report_stop(ctx: Ctx, stop: Stop) -> None:
         observed=observed, next_action=stop.next_action, diagnostics=stop.detail,
         token_expiry=expiry, opening=_opening(ctx))
     ctx.summary(f"## Stopped at {stop.stage}\n\n{observed}\n\n{stop.next_action}")
-    workflow = os.environ.get("GITHUB_WORKFLOW", "")
-    if workflow != REPORTING_WORKFLOW:
+    if not _in_release_workflow():
         # Any other workflow may run beside a release run, so a report from it could race one.
-        print(f"no issue filed: stop reports come only from the {REPORTING_WORKFLOW!r} workflow, "
-              f"not from {workflow or 'outside a workflow'!r}", file=sys.stderr)
+        print(f"no issue filed: stop reports come only from {BOT}'s {RELEASE_WORKFLOW}, not from "
+              f"{os.environ.get('GITHUB_WORKFLOW_REF') or 'outside a workflow'!r}",
+              file=sys.stderr)
         return
     try:
         key = (_stop_key(ctx, stop) if looked and not number and ctx.attempt_id == ctx.run_id
@@ -2746,6 +2742,15 @@ def _report_stop(ctx: Ctx, stop: Stop) -> None:
         _file_report(ctx, f"<!--auto-release:{key or att.run_id or ctx.run_id}-->", title, body)
     except Exception as exc:                                       # noqa: BLE001
         print(f"could not open the failure issue: {exc}", file=sys.stderr)
+
+
+def _in_release_workflow() -> bool:
+    """This job belongs to this repository's release.yml, by file, at any ref. GITHUB_WORKFLOW_REF
+    is `<owner>/<repo>/<workflow file>@<ref>`; a workflow's `name:` is not unique, its file is. Only
+    release.yml files stop reports: its one `release` concurrency group lets one run at a time,
+    so two reports of one key never race (tests/test_one_reporter.py pins the group)."""
+    path, at, ref = os.environ.get("GITHUB_WORKFLOW_REF", "").partition("@")
+    return bool(at and ref) and path == f"{BOT}/.github/workflows/{RELEASE_WORKFLOW}"
 
 
 def _stop_key(ctx: Ctx, stop: Stop) -> str:

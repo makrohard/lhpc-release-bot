@@ -1,7 +1,8 @@
 """No two stop reports ever run at the same time, so one key never gets two open issues by a race.
 
-1. At run time, `_report_stop` files only in a job of the release workflow (GITHUB_WORKFLOW is its
-   `name:`); a report from any other workflow, which could run beside a release run, is refused.
+1. At run time, `_report_stop` files only in a job of this repository's release.yml, identified
+   by file (GITHUB_WORKFLOW_REF, any ref), never by the `name:` other workflows may share; a report
+   from any other workflow, which could run beside a release run, is refused.
 2. release.yml is ONE concurrency group, `release`, never cancelled in progress, which no job
    overrides; its one matrix (`build`) runs one instance at a time: one release run, and in it
    one instance of each job at a time.
@@ -27,7 +28,8 @@ import yaml
 from bot import cli
 from tests.test_report import _plan_stop, _StopCtx, _StopStore
 
-RELEASE_YML = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
+RELEASE_YML = Path(__file__).resolve().parents[1] / ".github" / "workflows" / cli.RELEASE_WORKFLOW
+HERE = f"{cli.BOT}/.github/workflows/{cli.RELEASE_WORKFLOW}"
 NOT_REPORTING = {"web", "heartbeat"}
 
 EXPECTED = {   # reporting job: (needs, whole `if:`, whitespace normalised)
@@ -63,25 +65,35 @@ def _release() -> dict:
     return yaml.safe_load(RELEASE_YML.read_text())
 
 
-@pytest.mark.parametrize("workflow", ["", "ci", "release-copy", "Release"])
-def test_a_report_outside_the_release_workflow_files_nothing(monkeypatch, workflow):
-    if workflow:
-        monkeypatch.setenv("GITHUB_WORKFLOW", workflow)
+@pytest.mark.parametrize("ref", [
+    None,                                                    # outside GitHub Actions
+    "",
+    f"{cli.BOT}/.github/workflows/other.yml@refs/heads/main",   # a workflow NAMED release, elsewhere
+    f"someone/fork/.github/workflows/{cli.RELEASE_WORKFLOW}@refs/heads/main",  # another repo
+    f"{HERE}x@refs/heads/main",                              # a longer file name
+    f"x{HERE}@refs/heads/main",                              # a longer repository
+    f"{HERE}",                                               # no ref
+    f"{HERE}@",                                              # an empty ref
+    f"{cli.BOT}/.github/workflows/sub/{cli.RELEASE_WORKFLOW}@refs/heads/main",
+], ids=["unset", "empty", "other-file", "other-repo", "longer-file", "longer-repo", "no-ref",
+        "empty-ref", "sub-dir"])
+def test_a_report_outside_this_repositorys_release_yml_files_nothing(monkeypatch, ref):
+    if ref is None:
+        monkeypatch.delenv("GITHUB_WORKFLOW_REF")
     else:
-        monkeypatch.delenv("GITHUB_WORKFLOW")
+        monkeypatch.setenv("GITHUB_WORKFLOW_REF", ref)
+    monkeypatch.setenv("GITHUB_WORKFLOW", "release")         # the name proves nothing
     store = _StopStore()
     cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
     assert store.issues == {} and store.notes == {}
 
 
-def test_a_report_in_the_release_workflow_files_its_issue():
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/heads/topic", "refs/tags/v1"])
+def test_a_report_in_release_yml_at_any_ref_files_its_issue(monkeypatch, ref):
+    monkeypatch.setenv("GITHUB_WORKFLOW_REF", f"{HERE}@{ref}")
     store = _StopStore()
     cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
     assert list(store.issues) == [1]
-
-
-def test_the_reporting_workflow_is_release_yml_by_its_name():
-    assert _release()["name"] == cli.REPORTING_WORKFLOW
 
 
 def test_one_release_run_at_a_time_with_one_instance_of_each_job_at_a_time():
