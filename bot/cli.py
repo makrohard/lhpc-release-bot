@@ -98,7 +98,7 @@ class Stop(RuntimeError):
         # repeated stop reports into one open issue per stage, version and reason (`_stop_key`).
         self.code = code
         # Set by `_recover_stop`: the outcome is the one already reported for the attempt, and
-        # (number, record, note) to write into the record once the report is filed.
+        # (number, record, note, outcome) to write into the record once the report is filed.
         self.unchanged, self.recovery = False, None
 
 
@@ -2138,22 +2138,28 @@ def _replaced(stack: str, live: dict, snapshot: dict) -> str:
                            for k in gone)
 
 
-def _recover_stop(ctx: Ctx, number: int, att: Attempt, note: str, stop: Stop) -> Stop:
+def _recover_stop(ctx: Ctx, number: int, att: Attempt, outcome: str, stop: Stop,
+                  run: dict | None = None) -> Stop:
     """End a recovery that cannot finish. Every scheduled run re-recovers a blocked attempt, and
     the same outcome said each run is noise: an outcome equal to the one last REPORTED for the
     attempt is marked unchanged and `main` reports nothing. Any other outcome is reported, and only
     once its report was filed does `main` write the note and `last_report` (`_remember_report`): a
     report that failed, or a run that died on the way, leaves the record as it was, so the next
-    run reports again. The run is red either way, and its job summary says why."""
-    stop.unchanged, stop.recovery = note == att.last_report, (number, att, note)
+    run reports again. The run is red either way, and its job summary says why.
+
+    `outcome` holds nothing that changes from run to run. `run`, the rollback run that failed, is
+    named in the note only (`<outcome>: <its url>`): every recovery dispatches a new one, so the
+    same failure comes with a new url each time."""
+    note = f"{outcome}: {run.get('html_url')}" if run else outcome
+    stop.unchanged, stop.recovery = outcome == att.last_report, (number, att, note, outcome)
     return stop
 
 
-def _remember_report(ctx: Ctx, number: int, att: Attempt, note: str) -> None:
+def _remember_report(ctx: Ctx, number: int, att: Attempt, note: str, outcome: str) -> None:
     """After a recovery's report was filed: the note into the record, and the outcome as reported.
     A save that fails only means the next run reports the same outcome once more."""
     att.notes.append(note)
-    att.last_report = note
+    att.last_report = outcome
     try:
         ctx.save_attempt(number, att)
     except Exception as exc:                                       # noqa: BLE001
@@ -2188,11 +2194,11 @@ def _withdraw_unproven(ctx: Ctx, number: int, att: Attempt, live: dict) -> dict:
     ctx.save_attempt(number, att)
     run = ctx.gh.wait(BIN, rb, BOUNDS["settle"], poll_s=15, rerun=False)
     if run.get("conclusion") != "success":
-        raise _recover_stop(ctx, number, att, f"WITHDRAWAL NOT CONFIRMED: {run.get('html_url')}",
-                            Stop("recover", "this attempt's unproven binaries could not be "
-                                 "withdrawn from index-v3.json.", "The attempt stays open and "
-                                 "blocks new releases. Inspect the rollback run, then re-run "
-                                 "`recover`.", detail=run.get("html_url", "")))
+        raise _recover_stop(ctx, number, att, (
+            f"WITHDRAWAL NOT CONFIRMED ({run.get('conclusion') or 'not finished'})"), Stop(
+            "recover", "this attempt's unproven binaries could not be withdrawn from "
+            "index-v3.json.", "The attempt stays open and blocks new releases. Inspect the "
+            "rollback run, then re-run `recover`.", detail=run.get("html_url", "")), run=run)
     live = _live_index(ctx, att.binary_index).get("stacks", {})
     still = sorted(s for s, k in keys.items() if k[0] in [entry_key(e) for e in live.get(s) or []])
     if still:
@@ -2345,11 +2351,11 @@ def stage_recover(ctx: Ctx, run_id: str = "") -> int:
         ctx.save_attempt(number, att)
         run = ctx.gh.wait(BIN, rb, BOUNDS["settle"], poll_s=15, rerun=False)
         if run.get("conclusion") != "success":
-            raise _recover_stop(ctx, number, att, f"ROLLBACK NOT CONFIRMED: {run.get('html_url')}",
-                                Stop("recover", "the binary index could not be restored.",
-                                     "This attempt stays open and blocks new releases. Inspect the "
-                                     "rollback run, then re-run `recover`.",
-                                     detail=run.get("html_url", "")))
+            raise _recover_stop(ctx, number, att, (
+                f"ROLLBACK NOT CONFIRMED ({run.get('conclusion') or 'not finished'})"), Stop(
+                "recover", "the binary index could not be restored.", "This attempt stays open "
+                "and blocks new releases. Inspect the rollback run, then re-run `recover`.",
+                detail=run.get("html_url", "")), run=run)
         back = _live_index(ctx, att.binary_index).get("stacks", {})
         wrong = [s for s in restore if _canon(back.get(s)) != _canon(snapshot.get(s))]
         if wrong:

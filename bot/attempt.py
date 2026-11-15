@@ -90,9 +90,10 @@ class Attempt:
     # the same commit as `main`, and that is still a rehearsal.
     base_ref: str = "main"
     notes: list = field(default_factory=list)
-    # The outcome (its note) a stopped recovery last reported for this attempt. A blocked attempt
-    # is re-recovered by every scheduled run; the same outcome is reported once, a changed one
-    # again. A record written before this field reads as "never reported".
+    # The outcome a stopped recovery last reported for this attempt: its note without the url of
+    # the run that failed. A blocked attempt is re-recovered by every scheduled run; the same
+    # outcome is reported once, a changed one again. A record written before this field reads as
+    # "never reported".
     last_report: str = ""
     # The moved findings as the plan saw them (key, current, candidate, …): the Inputs table of a
     # report written after the plan, when the stage that stops no longer has the findings.

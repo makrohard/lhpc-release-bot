@@ -10,6 +10,8 @@ Milestones only.
   adds no note and no comment: only a changed outcome is reported. The run stays red and its job
   summary says why. Upgrade: attempt records gain `last_report`; a bot older than this cannot
   read a record that has it, so do not roll the bot back past this while an attempt is open.
+  A withdrawal or rollback that fails the same way again is the same outcome, although each
+  recovery dispatches a new rollback run. Upgrade: an attempt blocked on one is reported once more.
 - Recovery never settles a publish whose run id was lost (the attempt stays open); a release is
   recorded only when `main` and the tag both name the candidate, whatever the push answered.
 - Recovery withdraws an unproven attempt's own binaries from index-v3.json (installed copies stay);

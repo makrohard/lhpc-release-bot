@@ -200,7 +200,7 @@ def test_every_recovery_stop_notes_and_reports_an_unchanged_outcome_once(monkeyp
         assert cli.main(["recover", "--attempt", "100"]) == 1
     assert len(reported) == 1 and SITES[site] in reported[0].observed
     assert len(ctx.att.notes) == len(set(ctx.att.notes)), ctx.att.notes
-    assert ctx.att.last_report == ctx.att.notes[-1]
+    assert ctx.att.notes[-1].startswith(ctx.att.last_report)
 
 
 class _FailingComments(_Issues):
@@ -257,3 +257,75 @@ def test_a_report_refused_outside_release_yml_is_not_remembered(monkeypatch, tmp
     monkeypatch.setenv("GITHUB_WORKFLOW_REF", f"{cli.BOT}/.github/workflows/ci.yml@refs/heads/x")
     _recover(monkeypatch, issues, tmp_path, "201")
     assert issues.notes[2] == [] and _record(issues).last_report == ""
+
+
+class _FreshRuns:
+    """As on GitHub: every rollback dispatch is a NEW run, so the run that failed has a new id and
+    url at each recovery. `conclusion`, when set, is how that run ends instead."""
+    conclusion = None
+
+    def dispatch(self, repo, workflow, ref, inputs=None):
+        super().dispatch(repo, workflow, ref, inputs)
+        self.last_run = getattr(self, "last_run", 900) + 1
+        return self.last_run
+
+    def wait(self, repo, run_id, bound, poll_s=30.0, rerun=True, external=None):
+        rollback = int(run_id) > 900
+        run = super().wait(repo, 900 if rollback else run_id, bound, poll_s, rerun, external)
+        if rollback:
+            run["html_url"] = f"https://example.invalid/{run_id}"
+            if self.conclusion and self.withdraw == "fail":
+                run["conclusion"] = self.conclusion
+        return run
+
+
+def _fresh(site):
+    ctx = _site(site)
+    ctx.__class__ = type("Fresh", (_FreshRuns, type(ctx)), {})
+    return ctx
+
+
+def _reports(monkeypatch, tmp_path, ctx, runs, change=lambda ctx, i: None):
+    ctx.work, ctx.summaries, reported = tmp_path, [], []
+    monkeypatch.setattr(cli, "Ctx", lambda: ctx)
+    monkeypatch.setattr(cli, "_report_stop", lambda c, stop: reported.append(stop) or True)
+    for i in range(runs):
+        change(ctx, i)
+        tmp_path.mkdir(exist_ok=True)
+        assert cli.main(["recover", "--attempt", "100"]) == 1
+    return reported
+
+
+@pytest.mark.parametrize("site", ["withdraw-fail", "rollback-fail"])
+def test_the_same_failure_in_a_new_rollback_run_is_reported_once(monkeypatch, tmp_path, site):
+    """N1: the note names the rollback run that failed, and each recovery dispatches a new one.
+    Its url is not the outcome: three recoveries failing alike are one report and one note."""
+    ctx = _fresh(site)
+    reported = _reports(monkeypatch, tmp_path, ctx, 3)
+    assert ctx.last_run == 903, "each recovery dispatched its own rollback run"
+    assert len(reported) == 1 and SITES[site] in reported[0].observed
+    assert reported[0].detail == "https://example.invalid/901"
+    assert [n for n in ctx.att.notes if "NOT CONFIRMED" in n] == [
+        next(n for n in ctx.att.notes if "NOT CONFIRMED" in n)]
+    assert "https://example.invalid/901" in ctx.att.notes[-1]
+
+
+@pytest.mark.parametrize("site", ["withdraw-fail", "rollback-fail"])
+def test_a_different_failure_of_the_rollback_is_reported(monkeypatch, tmp_path, site):
+    """Failed, cancelled, failed: three outcomes, each a change, so three reports."""
+    ctx = _fresh(site)
+    reported = _reports(monkeypatch, tmp_path, ctx, 3, lambda c, i: setattr(
+        c, "conclusion", ["failure", "cancelled", "failure"][i]))
+    assert [s.detail.rsplit("/", 1)[1] for s in reported] == ["901", "902", "903"]
+
+
+@pytest.mark.parametrize("site", ["withdraw-fail", "rollback-fail"])
+def test_a_rollback_failure_after_another_outcome_is_reported(monkeypatch, tmp_path, site):
+    """Not confirmed, then the run succeeds but the index reads back wrong, then not confirmed
+    again: each differs from the outcome reported before it."""
+    ctx = _fresh(site)
+    reported = _reports(monkeypatch, tmp_path, ctx, 3, lambda c, i: setattr(
+        c, "withdraw", ["fail", "noop", "fail"][i]))
+    assert len(reported) == 3
+    assert SITES[site] in reported[0].observed and SITES[site] in reported[2].observed
+    assert SITES[site] not in reported[1].observed
