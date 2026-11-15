@@ -7,6 +7,8 @@ Driven through `main`, the path a scheduled run takes: `recover --attempt`, the 
 and written back to its issue body, the stop reported into the attempt's issue."""
 from __future__ import annotations
 
+import pytest
+
 from bot import cli
 from bot.attempt import Attempt
 from tests.test_transaction import _RecoverCtx, v3entry
@@ -118,3 +120,81 @@ def test_a_record_written_before_the_field_existed_reports_its_first_recovery(mo
     _recover(monkeypatch, issues, tmp_path, "201")
     _recover(monkeypatch, issues, tmp_path, "202")
     assert len(issues.notes[2]) == 1
+
+
+class _Legacy(_RecoverCtx):
+    """An attempt that published into index.json (the pointer index): recovery restores the
+    snapshot entry through rollback.yml and reads the index back. `withdraw` is what that run
+    does: "fail" (the run fails) or "noop" (it succeeds and changes nothing)."""
+
+    def __init__(self, withdraw):
+        mine, old = v3entry("6"), v3entry("8")
+        super().__init__(fragment=mine, live=[], snapshot=[], withdraw=withdraw)
+        self.att.binary_index, self.att.published = "index.json", {"meshtastic": mine}
+        self.att.index_snapshot = {"stacks": {"meshtastic": old}}
+        self.legacy = {"stacks": {"meshtastic": mine}}
+
+    def release_asset(self, repo, tag, name):
+        import json
+        assert name == "index.json"
+        return json.dumps(self.legacy).encode()
+
+    def dispatch(self, repo, workflow, ref, inputs=None):
+        self.dispatches.append((workflow, dict(inputs or {})))
+        return 900
+
+
+class _TagTaken(_RecoverCtx):
+    def ref(self, repo, ref):
+        return "f" * 40 if ref.startswith("tags/") else super().ref(repo, ref)
+
+
+def _own_v3(run="777.1"):
+    from tests.test_transaction import _own
+    return _own(run=run)
+
+
+def _site(name):
+    from tests.test_transaction import core
+    old, mine = v3entry("8"), _own_v3()
+    if name == "tag-taken":
+        return _TagTaken(fragment=core(mine), live=[mine, old], snapshot=[old])
+    if name == "unsettled":
+        ctx = _RecoverCtx(fragment=None, live=[old], snapshot=[old])
+        del ctx.att.runs["binary:meshtastic"]
+        return ctx
+    if name == "cannot-claim":
+        theirs = _own_v3(run="888.1")
+        return _RecoverCtx(fragment=core(theirs), live=[theirs, old], snapshot=[old])
+    if name == "no-build-run":
+        legacy = _own_v3(run=None)
+        return _RecoverCtx(fragment=core(legacy), live=[legacy, old], snapshot=[old])
+    if name in ("withdraw-fail", "withdraw-noop"):
+        return _RecoverCtx(fragment=core(mine), live=[mine, old], snapshot=[old],
+                           withdraw=name.split("-")[1])
+    return _Legacy(withdraw={"rollback-fail": "fail", "rollback-differs": "noop"}[name])
+
+
+SITES = {   # every place a recovery stops with a note, and the words of its stop
+    "tag-taken": "held by a different commit",
+    "unsettled": "has not stopped",
+    "cannot-claim": "cannot claim",
+    "no-build-run": "without the run that published it",
+    "withdraw-fail": "could not be withdrawn",
+    "withdraw-noop": "still holds this attempt's entry",
+    "rollback-fail": "could not be restored",
+    "rollback-differs": "not the snapshot",
+}
+
+
+@pytest.mark.parametrize("site", sorted(SITES))
+def test_every_recovery_stop_notes_and_reports_an_unchanged_outcome_once(site):
+    ctx = _site(site)
+    stops = []
+    for _ in range(2):
+        with pytest.raises(cli.Stop, match=SITES[site]) as raised:
+            cli.stage_recover(ctx, "100")
+        stops.append(raised.value)
+    assert [s.unchanged for s in stops] == [False, True]
+    assert len(ctx.att.notes) == len(set(ctx.att.notes)), ctx.att.notes
+    assert ctx.att.last_report == ctx.att.notes[-1]
