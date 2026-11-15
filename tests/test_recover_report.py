@@ -188,13 +188,72 @@ SITES = {   # every place a recovery stops with a note, and the words of its sto
 
 
 @pytest.mark.parametrize("site", sorted(SITES))
-def test_every_recovery_stop_notes_and_reports_an_unchanged_outcome_once(site):
+def test_every_recovery_stop_notes_and_reports_an_unchanged_outcome_once(monkeypatch, tmp_path,
+                                                                         site):
     ctx = _site(site)
-    stops = []
+    ctx.work, ctx.summaries = tmp_path, []
+    reported = []
+    monkeypatch.setattr(cli, "Ctx", lambda: ctx)
+    monkeypatch.setattr(cli, "_report_stop", lambda c, stop: reported.append(stop) or True)
     for _ in range(2):
-        with pytest.raises(cli.Stop, match=SITES[site]) as raised:
-            cli.stage_recover(ctx, "100")
-        stops.append(raised.value)
-    assert [s.unchanged for s in stops] == [False, True]
+        tmp_path.mkdir(exist_ok=True)
+        assert cli.main(["recover", "--attempt", "100"]) == 1
+    assert len(reported) == 1 and SITES[site] in reported[0].observed
     assert len(ctx.att.notes) == len(set(ctx.att.notes)), ctx.att.notes
     assert ctx.att.last_report == ctx.att.notes[-1]
+
+
+class _FailingComments(_Issues):
+    """The bot's issues, whose next `fail` comments raise (an API error, a cut connection)."""
+
+    def __init__(self, fail=1):
+        super().__init__()
+        self.fail = fail
+
+    def comment(self, repo, number, body):
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("HTTP 502")
+        super().comment(repo, number, body)
+
+
+def test_a_report_that_failed_leaves_the_record_as_it_was_and_the_next_run_reports(monkeypatch,
+                                                                                  tmp_path):
+    issues = _FailingComments(fail=1)
+    _blocked(issues, tmp_path)
+    record = issues.issues[1]["body"]
+    _recover(monkeypatch, issues, tmp_path, "201")
+    assert issues.notes[2] == [] and issues.issues[1]["body"] == record
+    _recover(monkeypatch, issues, tmp_path, "202")
+    assert len(issues.notes[2]) == 1 and "/run/202" in issues.notes[2][0]
+    assert _record(issues).last_report.startswith("recovery could not settle")
+    _recover(monkeypatch, issues, tmp_path, "203")
+    assert len(issues.notes[2]) == 1
+
+
+def test_a_run_that_dies_after_its_report_reports_again(monkeypatch, tmp_path):
+    """Filed, then the record could not be saved (or the job was killed): the outcome is not
+    remembered, so the next run reports it once more. Twice is the price; never is not."""
+    issues = _Issues()
+    _blocked(issues, tmp_path)
+    saves, real = [], _Run.save_attempt
+
+    def lost(self, number, att):
+        saves.append(att.last_report)
+        if len(saves) == 1:
+            raise RuntimeError("HTTP 502")
+        return real(self, number, att)
+    monkeypatch.setattr(_Run, "save_attempt", lost)
+    _recover(monkeypatch, issues, tmp_path, "201")
+    _recover(monkeypatch, issues, tmp_path, "202")
+    _recover(monkeypatch, issues, tmp_path, "203")
+    assert saves and saves[-1].startswith("recovery could not settle")
+    assert [b.split("/run/")[1][:3] for b in issues.notes[2]] == ["201", "202"]
+
+
+def test_a_report_refused_outside_release_yml_is_not_remembered(monkeypatch, tmp_path):
+    issues = _Issues()
+    _blocked(issues, tmp_path)
+    monkeypatch.setenv("GITHUB_WORKFLOW_REF", f"{cli.BOT}/.github/workflows/ci.yml@refs/heads/x")
+    _recover(monkeypatch, issues, tmp_path, "201")
+    assert issues.notes[2] == [] and _record(issues).last_report == ""

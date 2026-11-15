@@ -97,8 +97,9 @@ class Stop(RuntimeError):
         # The reason, as a fixed word, on the stops that recur before any attempt exists. With it a
         # repeated stop reports into one open issue per stage, version and reason (`_stop_key`).
         self.code = code
-        # Set by `_recover_stop` when this outcome is the one already reported for the attempt.
-        self.unchanged = False
+        # Set by `_recover_stop`: the outcome is the one already reported for the attempt, and
+        # (number, record, note) to write into the record once the report is filed.
+        self.unchanged, self.recovery = False, None
 
 
 def git(*args, cwd=None, check=True) -> str:
@@ -2138,17 +2139,25 @@ def _replaced(stack: str, live: dict, snapshot: dict) -> str:
 
 
 def _recover_stop(ctx: Ctx, number: int, att: Attempt, note: str, stop: Stop) -> Stop:
-    """End a recovery that cannot finish. The note goes into the record and the stop is reported
-    only when this outcome differs from the one last reported for the attempt: every scheduled
-    run re-recovers a blocked attempt, and the same outcome said each run is noise. The run is
-    red either way, and its job summary says why."""
-    if note == att.last_report:
-        stop.unchanged = True
-    else:
-        att.notes.append(note)
-        att.last_report = note
-        ctx.save_attempt(number, att)
+    """End a recovery that cannot finish. Every scheduled run re-recovers a blocked attempt, and
+    the same outcome said each run is noise: an outcome equal to the one last REPORTED for the
+    attempt is marked unchanged and `main` reports nothing. Any other outcome is reported, and only
+    once its report was filed does `main` write the note and `last_report` (`_remember_report`): a
+    report that failed, or a run that died on the way, leaves the record as it was, so the next
+    run reports again. The run is red either way, and its job summary says why."""
+    stop.unchanged, stop.recovery = note == att.last_report, (number, att, note)
     return stop
+
+
+def _remember_report(ctx: Ctx, number: int, att: Attempt, note: str) -> None:
+    """After a recovery's report was filed: the note into the record, and the outcome as reported.
+    A save that fails only means the next run reports the same outcome once more."""
+    att.notes.append(note)
+    att.last_report = note
+    try:
+        ctx.save_attempt(number, att)
+    except Exception as exc:                                       # noqa: BLE001
+        print(f"the report was filed but the record could not be saved: {exc}", file=sys.stderr)
 
 
 def _withdraw_unproven(ctx: Ctx, number: int, att: Attempt, live: dict) -> dict:
@@ -2680,7 +2689,8 @@ def main(argv=None) -> int:
                         f"{stop.observed}\n\n{stop.next_action}")
             return 1
         report_retry_outcome(ctx, f"stopped at {stop.stage} — {stop.observed}")
-        _report_stop(ctx, stop)
+        if _report_stop(ctx, stop) and stop.recovery:
+            _remember_report(ctx, *stop.recovery)
         return 1
     except Unreadable as exc:
         # An issue wearing the `attempt` label with no record in it. Fail closed, but say the
@@ -2720,8 +2730,9 @@ def _opening(ctx: Ctx) -> str:
     return "The dispatched release run"
 
 
-def _report_stop(ctx: Ctx, stop: Stop) -> None:
-    """Always produce a report. Everything that could fail on the way is optional."""
+def _report_stop(ctx: Ctx, stop: Stop) -> bool:
+    """Always produce a report. Everything that could fail on the way is optional. True when the
+    issue report was filed."""
     att, number, looked = Attempt(run_id=ctx.attempt_id), 0, True
     try:
         found_number, found = ctx.find_attempt(ctx.attempt_id)
@@ -2752,13 +2763,15 @@ def _report_stop(ctx: Ctx, stop: Stop) -> None:
         print(f"no issue filed: stop reports come only from {BOT}'s {RELEASE_WORKFLOW}, not from "
               f"{os.environ.get('GITHUB_WORKFLOW_REF') or 'outside a workflow'!r}",
               file=sys.stderr)
-        return
+        return False
     try:
         key = (_stop_key(ctx, stop) if looked and not number and ctx.attempt_id == ctx.run_id
                else "")
         _file_report(ctx, f"<!--auto-release:{key or att.run_id or ctx.run_id}-->", title, body)
     except Exception as exc:                                       # noqa: BLE001
         print(f"could not open the failure issue: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def _in_release_workflow() -> bool:
