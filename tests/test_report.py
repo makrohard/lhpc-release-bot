@@ -151,17 +151,21 @@ def test_an_expiring_incident_promises_renewal_only_on_an_attributable_regressio
 # ---- one open issue per problem: a stop with no attempt, by stage, version and reason ----
 
 class _StopStore(_Store):
-    """`_Store`, plus a list that can lag: `hide` issue numbers stay invisible to the next
-    `open_issues` call, the way a second run's issue is invisible to a run that already looked."""
+    """`_Store`, plus a listing that can lag: each set in `hides` is consumed by one
+    `open_issues` call and keeps those numbers out of it, the way another run's issue, or one just
+    created, can be missing from a listing."""
 
     def __init__(self):
         super().__init__()
-        self.hide = set()
+        self.hides = []
 
     def open_issues(self, repo, label):
-        seen = [i for i in super().open_issues(repo, label) if i["number"] not in self.hide]
-        self.hide = set()
-        return seen
+        hide = self.hides.pop(0) if self.hides else set()
+        return [i for i in super().open_issues(repo, label) if i["number"] not in hide]
+
+    def put(self, number, body):                   # an issue some other run created
+        self.issues[number] = {"title": "t", "state": "open", "body": body}
+        self.notes[number] = []
 
 
 class _StopCtx:
@@ -268,11 +272,50 @@ def test_a_closed_issue_is_not_reopened_by_comment():
     assert list(_open(store)) == [2] and not store.notes[1]
 
 
-def test_two_runs_that_race_leave_one_open_issue_the_oldest():
+KEY = "<!--auto-release:stop:plan:0.12.11:version-taken-->"
+
+
+def _report(store, run="102"):
+    cli._report_stop(_StopCtx(store, run, version="0.12.11"), _plan_stop())
+
+
+def test_a_race_where_the_new_issue_is_not_listed_yet_still_leaves_one_open():
+    # The verdict's sequence: the first look misses #1, the look after the create misses #2.
     store = _StopStore()
-    cli._report_stop(_StopCtx(store, "101", version="0.12.11"), _plan_stop())
-    store.hide = {1}                     # the second run looked before the first one's issue
-    cli._report_stop(_StopCtx(store, "102", version="0.12.11"), _plan_stop())
+    store.put(1, f"other run\n{KEY}\n")
+    store.n = 1
+    store.hides = [{1}, {2}]
+    _report(store)
     assert list(_open(store)) == [1], "the newer issue is closed as the duplicate"
-    assert any("/run/9" in n for n in store.notes[1]), "its report went to the oldest"
-    assert store.notes[2] and "Duplicate of #1" in store.notes[2][-1]
+    assert store.notes[1] and "/run/9" in store.notes[1][0], "the report went to the survivor"
+    assert "Duplicate of #1" in store.notes[2][-1]
+
+
+def test_three_runs_that_race_leave_the_lowest_open():
+    store = _StopStore()
+    store.put(1, f"run a\n{KEY}\n")
+    store.put(2, f"run b\n{KEY}\n")
+    store.n = 2
+    store.hides = [{1, 2}, {3}]
+    _report(store, "103")
+    assert list(_open(store)) == [1]
+    assert all("Duplicate of #1" in store.notes[n][-1] for n in (2, 3))
+
+
+def test_when_the_new_issue_is_the_lowest_it_survives_and_carries_its_own_report():
+    store = _StopStore()
+    store.put(5, f"run a\n{KEY}\n")
+    store.hides = [{5}, {1}]                       # own becomes #1, unlisted after the create
+    _report(store)
+    assert list(_open(store)) == [1] and not store.notes[1], "its body is the report"
+    assert "Duplicate of #1" in store.notes[5][-1]
+
+
+def test_duplicates_left_by_an_earlier_run_are_settled_by_the_next_report():
+    store = _StopStore()
+    store.put(1, f"run a\n{KEY}\n")
+    store.put(2, f"run b\n{KEY}\n")
+    store.n = 2
+    _report(store)
+    assert list(_open(store)) == [1] and len(store.notes[1]) == 1
+    assert "Duplicate of #1" in store.notes[2][-1] and store.n == 2, "nothing new was created"

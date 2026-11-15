@@ -2752,28 +2752,30 @@ def _stop_key(ctx: Ctx, stop: Stop) -> str:
 
 
 def _file_report(ctx: Ctx, marker: str, title: str, body: str) -> None:
-    """Report into the ONE open issue carrying `marker`: a comment on it, or a new issue.
+    """Report into the ONE open issue carrying `marker`, and leave exactly one open.
 
-    One release run runs at a time (release.yml's concurrency group), so two reports of one key
-    do not normally race. If they do, both looked before either created: the look after the
-    create finds both, the oldest stays, and the newer is closed as its duplicate."""
+    One release run runs at a time (release.yml's concurrency group), so two reports of one key do
+    not normally race. Should they, or should an earlier cleanup have been cut short, every report
+    settles the same way: the survivor is the LOWEST number among the open issues with the marker
+    and the issue this report created (which a listing right after the create may not show yet);
+    it carries the report, and every other one is closed as its duplicate. Two runs that see each
+    other's issues therefore pick the same survivor."""
     text = body + f"\n{marker}\n"
 
-    def holders() -> list:
-        return sorted(i["number"] for i in ctx.bot_gh.open_issues(BOT, "auto-release")
-                      if marker in (i.get("body") or ""))
+    def holders() -> set:
+        return {i["number"] for i in ctx.bot_gh.open_issues(BOT, "auto-release")
+                if marker in (i.get("body") or "")}
 
     found = holders()
-    if found:
-        ctx.bot_gh.comment(BOT, found[0], text)
-        return
-    own = ctx.bot_gh.create_issue(BOT, title, text, ["auto-release"])["number"]
-    found = holders()
-    if found and found[0] != own:
-        ctx.bot_gh.comment(BOT, found[0], text)
-    for number in found[1:]:
-        ctx.bot_gh.comment(BOT, number, f"Duplicate of #{found[0]}: two runs reported the same "
-                                        "stop at once; the oldest issue carries the reports.")
+    own = 0 if found else ctx.bot_gh.create_issue(BOT, title, text, ["auto-release"])["number"]
+    if own:
+        found = holders() | {own}
+    survivor, *duplicates = sorted(found)
+    if survivor != own:
+        ctx.bot_gh.comment(BOT, survivor, text)
+    for number in duplicates:
+        ctx.bot_gh.comment(BOT, number, f"Duplicate of #{survivor}: the same stop was reported "
+                                        "into more than one issue; that one carries the reports.")
         ctx.bot_gh.update_issue(BOT, number, state="closed")
 
 
