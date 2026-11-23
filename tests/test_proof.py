@@ -812,25 +812,32 @@ def test_a_gate_report_that_cannot_read_its_jobs_never_stops_prove():
     assert "the candidate is not proven" in stop.value.observed
 
 
-CI_YML = """jobs:
+CI_YML = """on:
+  push:
+jobs:
   test:
     timeout-minutes: {test}
     steps:
       - run: x
+        timeout-minutes: 500
   guards:
-    timeout-minutes: 15
+    timeout-minutes: 15  # a comment
 """
+
+UNSTATED_JOB = "  meshcore-host:\n    runs-on: x\n"
 
 
 @pytest.mark.parametrize("text, minutes", [
-    (CI_YML.format(test=60), 70),                 # LHPC ci.yml today: the test job's 60 + 10
+    (CI_YML.format(test=60), 70),                 # every job states one: the longest 60 + 10
     (CI_YML.format(test=90), 100),                # the ceiling moves, the wait moves with it
+    (CI_YML.format(test=60) + UNSTATED_JOB, 370),  # LHPC ci.yml today: meshcore-host states none
     ("jobs:\n  test:\n    runs-on: x\n", 370),  # none stated: GitHub's default 360 + 10
     ("", 370),                                    # unreadable: the same, never shorter
 ])
-def test_the_ci_wait_is_the_candidates_own_ci_ceiling_plus_the_margin(text, minutes):
+def test_the_ci_wait_is_the_candidates_longest_job_ceiling_plus_the_margin(text, minutes):
     # A bound below the CI's own ceiling called a green, still-running CI "not finished" (the
-    # rehearsal's R2: CI 49 min against a constant 40 min).
+    # rehearsal's R2: CI 49 min against a constant 40 min). A job without timeout-minutes runs
+    # up to GitHub's 360, a step-level one is not the job's ceiling.
     assert cli.ci_bound(text) == minutes * 60
 
 
@@ -840,7 +847,7 @@ def test_prove_waits_for_ci_as_long_as_the_candidates_ci_yml_says(monkeypatch):
     class Gh:
         def file_at(self, repo, path, ref):
             read.append((path, ref))
-            return CI_YML.format(test=90) if path == cli.CI_WORKFLOW_PATH else ""
+            return CI_YML.format(test=90) if path == ".github/workflows/ci.yml" else ""
 
         def artifact_member(self, *a, **k):
             return None
@@ -860,5 +867,5 @@ def test_prove_waits_for_ci_as_long_as_the_candidates_ci_yml_says(monkeypatch):
                   candidate_sha="c" * 40, branch="pins/0.3.7-1",
                   runs={"ci": {"repo": "r", "id": 11}, "testlab": {"repo": "r", "id": 12}})
     cli.prove_verdict(Ctx(), att, 7)
-    assert (cli.CI_WORKFLOW_PATH, "c" * 40) in read
+    assert (".github/workflows/ci.yml", "c" * 40) in read
     assert waited[11] == 100 * 60

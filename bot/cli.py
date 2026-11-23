@@ -1649,13 +1649,40 @@ CI_WAIT_MARGIN_S = 10 * 60
 
 
 def ci_bound(workflow_text: str) -> int:
-    """How long to wait for LHPC CI: its longest `timeout-minutes` (after which CI fails that job
-    itself, so waiting up to it can never hide a red run) plus the margin. A workflow that states
-    none, or cannot be read, gets GitHub's default job ceiling. The bound used to be a constant
-    below the CI's own: at 40 min the bot judged green, still-running CI "not finished" (green
-    runs took 29-51 min against a 60 min job ceiling)."""
-    stated = [int(m) for m in re.findall(r"(?m)^\s*timeout-minutes:\s*(\d+)\s*$", workflow_text or "")]
-    return (max(stated) if stated else GITHUB_DEFAULT_JOB_MINUTES) * 60 + CI_WAIT_MARGIN_S
+    """How long to wait for LHPC CI: the longest job ceiling (after which CI fails that job
+    itself, so waiting up to it can never hide a red run) plus the margin. A job's ceiling is
+    its job-level `timeout-minutes`; a job that states none runs up to GitHub's default, so it
+    counts as that default. A workflow with no jobs, or one that cannot be read, gets the
+    default too. The bound used to be a constant below the CI's own: at 40 min the bot judged
+    green, still-running CI "not finished" (green runs took 29-51 min against a 60 min job
+    ceiling)."""
+    ceilings: dict = {}
+    job, job_indent, key_indent, in_jobs = None, None, None, False
+    for line in (workflow_text or "").splitlines():
+        body = line.strip()
+        if not body or body.startswith("#"):
+            continue
+        lead = len(line) - len(line.lstrip(" "))
+        if lead == 0:
+            in_jobs = re.fullmatch(r"jobs:\s*(#.*)?", body) is not None
+            job = None
+            continue
+        if not in_jobs:
+            continue
+        if job_indent is None:
+            job_indent = lead
+        if lead == job_indent:
+            job, key_indent = body.split(":", 1)[0], None
+            ceilings[job] = GITHUB_DEFAULT_JOB_MINUTES
+            continue
+        if job is None:
+            continue
+        if key_indent is None:
+            key_indent = lead
+        stated = re.fullmatch(r"timeout-minutes:\s*(\d+)\s*(#.*)?", body)
+        if lead == key_indent and stated:
+            ceilings[job] = int(stated[1])
+    return max(ceilings.values(), default=GITHUB_DEFAULT_JOB_MINUTES) * 60 + CI_WAIT_MARGIN_S
 
 
 def required_release_cases(text: str) -> list:
