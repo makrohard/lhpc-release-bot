@@ -812,8 +812,53 @@ def test_a_gate_report_that_cannot_read_its_jobs_never_stops_prove():
     assert "the candidate is not proven" in stop.value.observed
 
 
-def test_the_ci_wait_outlasts_the_ceiling_of_the_ci_it_waits_for():
-    # LHPC ci.yml: the test job's timeout-minutes is 60. A bound below it calls a green CI that is
-    # still running "not finished" (R2 of the rehearsal: CI 49 min against a 40 min bound).
-    assert cli.LHPC_CI_JOB_CEILING_S == 60 * 60
-    assert cli.BOUNDS["ci"] > cli.LHPC_CI_JOB_CEILING_S
+CI_YML = """jobs:
+  test:
+    timeout-minutes: {test}
+    steps:
+      - run: x
+  guards:
+    timeout-minutes: 15
+"""
+
+
+@pytest.mark.parametrize("text, minutes", [
+    (CI_YML.format(test=60), 70),                 # LHPC ci.yml today: the test job's 60 + 10
+    (CI_YML.format(test=90), 100),                # the ceiling moves, the wait moves with it
+    ("jobs:\n  test:\n    runs-on: x\n", 370),  # none stated: GitHub's default 360 + 10
+    ("", 370),                                    # unreadable: the same, never shorter
+])
+def test_the_ci_wait_is_the_candidates_own_ci_ceiling_plus_the_margin(text, minutes):
+    # A bound below the CI's own ceiling called a green, still-running CI "not finished" (the
+    # rehearsal's R2: CI 49 min against a constant 40 min).
+    assert cli.ci_bound(text) == minutes * 60
+
+
+def test_prove_waits_for_ci_as_long_as_the_candidates_ci_yml_says(monkeypatch):
+    waited, read = {}, []
+
+    class Gh:
+        def file_at(self, repo, path, ref):
+            read.append((path, ref))
+            return CI_YML.format(test=90) if path == cli.CI_WORKFLOW_PATH else ""
+
+        def artifact_member(self, *a, **k):
+            return None
+
+    class Ctx:
+        gh = Gh()
+
+        def save_attempt(self, number, att):
+            return number
+
+    def wait(ctx, rec, bound, *a, **k):
+        waited[rec["id"]] = bound
+        return {"timed_out": True}
+
+    monkeypatch.setattr(cli, "_wait", wait)
+    att = Attempt(run_id="1", state="prepared", version="0.3.7", base_sha="a" * 40,
+                  candidate_sha="c" * 40, branch="pins/0.3.7-1",
+                  runs={"ci": {"repo": "r", "id": 11}, "testlab": {"repo": "r", "id": 12}})
+    cli.prove_verdict(Ctx(), att, 7)
+    assert (cli.CI_WORKFLOW_PATH, "c" * 40) in read
+    assert waited[11] == 100 * 60

@@ -73,11 +73,9 @@ BOT_URL = "https://github.com/" + BOT
 REQUIRED_CI = ("test (3.11)", "test (3.12)", "test (3.13)", "pin-validation", "meshcore-host")
 REQUIRED_TESTLAB = ("testlab", "release-verify", "slow-build")
 
-# `ci`: LHPC ci.yml caps its longest job (test) at timeout-minutes 60, after which CI fails that job
-# itself; waiting up to that ceiling can never hide a red run. +10 min for queueing and status lag.
-# At 40 min the bot judged green, still-running CI "not finished" (green runs took 29-51 min).
-LHPC_CI_JOB_CEILING_S = 60 * 60
-BOUNDS = {"ci": LHPC_CI_JOB_CEILING_S + 10 * 60, "binary": 190 * 60, "testlab": 280 * 60, "image": 330 * 60,
+# LHPC CI's wait is NOT a constant here: it is read from the candidate's own ci.yml (`ci_bound`).
+CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
+BOUNDS = {"binary": 190 * 60, "testlab": 280 * 60, "image": 330 * 60,
           "settle": 60 * 60, "web": 320 * 60}
 # The release lane's own case count. A lane that reports fewer has lost cases, whatever its
 # colour; the exact names are the lane's contract and are checked individually.
@@ -1395,7 +1393,8 @@ def prove_verdict(ctx: Ctx, att: Attempt, number: int, settled: bool = False) ->
     `settled` (recovery): the runs are judged as they stand after recovery cancelled them; no
     failed job is re-run and no degraded-gate report is written. The judgement is the same."""
     identity, outcome = [], []
-    for name, required, bound in (("ci", REQUIRED_CI, BOUNDS["ci"]),
+    ci_wait = ci_bound(ctx.gh.file_at(LHPC, CI_WORKFLOW_PATH, att.candidate_sha))
+    for name, required, bound in (("ci", REQUIRED_CI, ci_wait),
                                   ("testlab", REQUIRED_TESTLAB, BOUNDS["testlab"])):
         rec = att.runs.get(name)
         if not rec:
@@ -1643,6 +1642,22 @@ def _release_case_problems(junit: bytes, required) -> tuple:
     return [], red
 
 
+# GitHub's own ceiling for a job that states none, and the margin over a stated one for queueing
+# on hosted runners and the status lag of a poll.
+GITHUB_DEFAULT_JOB_MINUTES = 360
+CI_WAIT_MARGIN_S = 10 * 60
+
+
+def ci_bound(workflow_text: str) -> int:
+    """How long to wait for LHPC CI: its longest `timeout-minutes` (after which CI fails that job
+    itself, so waiting up to it can never hide a red run) plus the margin. A workflow that states
+    none, or cannot be read, gets GitHub's default job ceiling. The bound used to be a constant
+    below the CI's own: at 40 min the bot judged green, still-running CI "not finished" (green
+    runs took 29-51 min against a 60 min job ceiling)."""
+    stated = [int(m) for m in re.findall(r"(?m)^\s*timeout-minutes:\s*(\d+)\s*$", workflow_text or "")]
+    return (max(stated) if stated else GITHUB_DEFAULT_JOB_MINUTES) * 60 + CI_WAIT_MARGIN_S
+
+
 def required_release_cases(text: str) -> list:
     """The case names the candidate's own list declares. [] if it cannot be read."""
     try:
@@ -1720,6 +1735,8 @@ def stage_integrate(ctx: Ctx) -> int:
                    "`finish` repairs a release that stands. This attempt released nothing, so "
                    "there is nothing to integrate or cut an image for; `recover` owns it.")
     if att.integration:
+        # A recorded integration is a person's from here on: a PR whose `dev` moves on before it is
+        # merged is rebased or landed by hand; re-running this stage does not rebuild it.
         # Idempotent so a repair can re-run it: an attempt that owes integration is closed by
         # running this stage again, and one that does not must not push `dev` a second time.
         print(f"integration already done: {att.integration}")
@@ -1761,7 +1778,10 @@ def stage_integrate(ctx: Ctx) -> int:
         # A real conflict is a judgement call. Give the reviewer the release patch itself, with
         # the conflict visible on GitHub — never a resolved-looking branch, never conflict
         # markers, never an empty PR.
-        git("cherry-pick", "--abort", cwd=lhpc, check=False)
+        # `cherry-pick -n` keeps no sequencer state, so `--abort` has nothing to abort and the
+        # conflicted index stayed: the checkout below then refused and this path never opened its
+        # PR. The scratch clone is discarded to the integration branch's start instead.
+        git("reset", "-q", "--hard", cwd=lhpc)
         git("checkout", "-q", "-B", branch, att.candidate_sha, cwd=lhpc)
         git("push", "-q", "-f", "origin", f"HEAD:refs/heads/{branch}", cwd=lhpc)
         pr = ctx.gh.pull_request(

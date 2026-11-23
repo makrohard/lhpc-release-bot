@@ -177,3 +177,28 @@ def test_stage_integrate_brings_the_whole_release_to_a_dev_that_moved_on(planned
     assert "## 0.3.7" in git("show", f"{head}:CHANGELOG.md", cwd=origin)
     assert git("show", f"{head}:pyproject.toml", cwd=origin) == pyproject("0.3.7", "example>=1").strip()
     assert git("show", f"{head}:notes.txt", cwd=origin) == "dev moved on"
+
+
+def test_a_dev_that_conflicts_gets_the_candidate_itself_as_the_pull_request(planned, origin, tmp_path):
+    # Not a version collision: dev changed the same manifest line. The bot resolves nothing else, so
+    # the branch is the candidate (both commits) and a person sees the conflict on the PR.
+    att = planned.att
+    side = tmp_path / "side"
+    git("clone", "-q", str(origin), str(side), cwd=tmp_path)
+    git("config", "user.email", "t@example.invalid", cwd=side)
+    git("config", "user.name", "t", cwd=side)
+    git("checkout", "-q", "dev", cwd=side)
+    write(side, cli.MANIFEST, 'pin_commit = "z"\n')
+    git("add", "-A", cwd=side)
+    git("commit", "-q", "-m", "dev moved the same pin", cwd=side)
+    git("push", "-q", "origin", "dev", "--force", cwd=side)
+    git("push", "-q", "origin", f"{att.candidate_sha}:refs/heads/main", "--force", cwd=side)
+    work = tmp_path / "integrate"
+    work.mkdir()
+    ctx = _Ctx(origin, work, att=Attempt(**{**att.__dict__, "state": "released"}))
+    assert cli.stage_integrate(ctx) == 0
+    branch = f"integrate/{att.version}"
+    assert ctx.prs == [(branch, "dev")]
+    assert git("rev-parse", f"refs/heads/{branch}", cwd=origin) == att.candidate_sha
+    assert ctx.att.integration == "pr:41"
+

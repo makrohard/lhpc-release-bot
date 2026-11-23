@@ -59,7 +59,7 @@ id = "meshcore"
   [[stack.component]]
   id = "chat"
     build_steps = [
-      {{ argv = [".venv/bin/pip", "install", "-c", ".venv/lhpc-rns-constraint.txt", "-c", "{{asset}}/chat-constraints.txt", "aiohttp", "rns"] }},
+      {{ argv = [".venv/bin/pip", "install", "-c", ".venv/lhpc-rns-constraint.txt", "--constraint", "{{asset}}/chat-constraints.txt", "aiohttp", "rns"] }},
     ]
     [stack.component.source]
     path = "src/chat"
@@ -100,7 +100,8 @@ def test_the_governed_checkouts_are_read_from_the_manifest():
         # installs from {runtime}/src (the repeater, `--no-deps` beside it)
         ("node", "src/core", "", ("pyyaml", "psutil"), "repeater-constraints.txt"),
         ("node", "src/repeater", "", ("pyyaml", "psutil"), "repeater-constraints.txt"),
-        # its own file is the SECOND `-c` (the first holds pip to the node's wheel): still governed
+        # its own file is the SECOND constraint, spelled `--constraint` (the first, `-c`, holds pip to
+        # the node's wheel): still governed
         ("chat", "src/chat", "", ("aiohttp", "rns"), "chat-constraints.txt"),
     }
 
