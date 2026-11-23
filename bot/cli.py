@@ -73,7 +73,11 @@ BOT_URL = "https://github.com/" + BOT
 REQUIRED_CI = ("test (3.11)", "test (3.12)", "test (3.13)", "pin-validation", "meshcore-host")
 REQUIRED_TESTLAB = ("testlab", "release-verify", "slow-build")
 
-BOUNDS = {"ci": 40 * 60, "binary": 190 * 60, "testlab": 280 * 60, "image": 330 * 60,
+# `ci`: LHPC ci.yml caps its longest job (test) at timeout-minutes 60, after which CI fails that job
+# itself; waiting up to that ceiling can never hide a red run. +10 min for queueing and status lag.
+# At 40 min the bot judged green, still-running CI "not finished" (green runs took 29-51 min).
+LHPC_CI_JOB_CEILING_S = 60 * 60
+BOUNDS = {"ci": LHPC_CI_JOB_CEILING_S + 10 * 60, "binary": 190 * 60, "testlab": 280 * 60, "image": 330 * 60,
           "settle": 60 * 60, "web": 320 * 60}
 # The release lane's own case count. A lane that reports fewer has lost cases, whatever its
 # colour; the exact names are the lane's contract and are checked individually.
@@ -666,9 +670,7 @@ def stage_plan(ctx: Ctx) -> int:
         return 0
 
     git("checkout", "-q", "-b", branch, cwd=lhpc)
-    git("add", "-A", cwd=lhpc)
-    git("commit", "-q", "-m", version, "-m", "\n".join(f"- {b}" for b in bullets), cwd=lhpc)
-    candidate = git("rev-parse", "HEAD", cwd=lhpc)
+    candidate = commit_candidate(lhpc, version, bullets)
 
     att = Attempt(run_id=ctx.run_id, state="prepared", version=version, base_sha=base_sha,
                   candidate_sha=candidate, branch=branch, dev_sha=dev_sha,
@@ -694,6 +696,28 @@ def stage_plan(ctx: Ctx) -> int:
     ctx.summary(f"\nCandidate `{candidate[:9]}` on `{branch}`; binaries to rebuild: "
                 f"{', '.join(need) or 'none'}; attempt issue #{number}.")
     return 0
+
+
+def commit_candidate(lhpc: Path, version: str, bullets: list) -> str:
+    """Commit the edited checkout as the candidate: TWO commits, the moves first (manifest, scripts,
+    version scalars; the bullets in the body), then CHANGELOG.md alone. LHPC's house rules cap a
+    commit at two changelog bullets unless it changes CHANGELOG.md alone inside its top section
+    (the release section, written once), so one commit carrying both fails CI for every release
+    with more than two moves. Returns the candidate (the second commit)."""
+    git("add", "-A", cwd=lhpc)
+    git("reset", "-q", "--", "CHANGELOG.md", cwd=lhpc)
+    git("commit", "-q", "-m", version, "-m", "\n".join(f"- {b}" for b in bullets), cwd=lhpc)
+    git("add", "CHANGELOG.md", cwd=lhpc)
+    git("commit", "-q", "-m", f"{version}: changelog", cwd=lhpc)
+    return git("rev-parse", "HEAD", cwd=lhpc)
+
+
+def release_commit(lhpc: Path, candidate: str, base: str, version: str) -> str:
+    """The release as ONE commit object (the candidate's tree over its base), for the merge-back to
+    a `dev` that moved on: the candidate is two commits, and cherry-picking only its tip would
+    bring the changelog without the moves."""
+    return git("commit-tree", f"{candidate}^{{tree}}", "-p", base,
+               "-m", f"{version} (released from main)", cwd=lhpc)
 
 
 # The wall-clock a publishing run may need, including settling and undoing itself. Derived from
@@ -1726,9 +1750,10 @@ def stage_integrate(ctx: Ctx) -> int:
 
     branch = f"integrate/{att.version}"
     git("checkout", "-q", "-B", branch, "origin/dev", cwd=lhpc)
-    pick = subprocess.run(["git", "cherry-pick", "-n", att.candidate_sha], cwd=lhpc,
+    release = release_commit(lhpc, att.candidate_sha, att.base_sha, att.version)
+    pick = subprocess.run(["git", "cherry-pick", "-n", release], cwd=lhpc,
                           capture_output=True, text=True, check=False)
-    resolved = _resolve_version_conflicts(lhpc, att.version, att.candidate_sha)
+    resolved = _resolve_version_conflicts(lhpc, att.version, att.candidate_sha, att.base_sha)
     att.integration = ""
     conflicts = [ln[3:] for ln in git("status", "--porcelain", cwd=lhpc).splitlines()
                  if ln.startswith(("UU ", "AA ", "DU ", "UD "))]
@@ -1769,9 +1794,12 @@ def stage_integrate(ctx: Ctx) -> int:
     return 0
 
 
-def _merge_but_for_the_scalar(repo: Path, path: str, candidate: str, set_version, version: str):
+def _merge_but_for_the_scalar(repo: Path, path: str, candidate: str, set_version, version: str,
+                              base: str = ""):
     """A real three-way merge of one version-bearing file, with the version taken out of the
     argument. Returns the merged text, or `None` if the rest of the file genuinely conflicts.
+    `base` is the attempt's base: the candidate is two commits over it, so `<candidate>^` (the
+    default, for a one-commit candidate) is no longer the merge base.
 
     The version line is the ONE thing the two sides are always expected to disagree about, and it
     has a known answer — decided by the caller, and passed in as `version`. So the scalar is set
@@ -1787,7 +1815,7 @@ def _merge_but_for_the_scalar(repo: Path, path: str, candidate: str, set_version
     """
     try:
         sides = [set_version(git("show", f"{ref}:{path}", cwd=repo), version)
-                 for ref in ("origin/dev", f"{candidate}^", candidate)]
+                 for ref in ("origin/dev", base or f"{candidate}^", candidate)]
     except (RuntimeError, ValueError):
         return None                      # absent on a side, or no scalar to set: not ours to do
     with tempfile.TemporaryDirectory() as d:          # OUTSIDE the work tree: `git add -A` runs
@@ -1805,7 +1833,7 @@ def _merge_but_for_the_scalar(repo: Path, path: str, candidate: str, set_version
     return r.stdout if r.stdout.endswith("\n") else r.stdout + "\n"
 
 
-def _resolve_version_conflicts(repo: Path, version: str, candidate: str) -> list:
+def _resolve_version_conflicts(repo: Path, version: str, candidate: str, base: str = "") -> list:
     """The ONE resolution this bot makes: the two version scalars and the changelog placement.
 
     The scalars go to whichever version is genuinely newer — `dev`'s own if it has opened a later
@@ -1852,7 +1880,7 @@ def _resolve_version_conflicts(repo: Path, version: str, candidate: str) -> list
 
     for path, setter in (("pyproject.toml", cl.set_pyproject_version),
                          ("lhpc/version.py", cl.set_version_module)):
-        merged = _merge_but_for_the_scalar(repo, path, candidate, setter, target)
+        merged = _merge_but_for_the_scalar(repo, path, candidate, setter, target, base)
         if merged is None:
             continue                     # stays conflicted -> the PR shows a person the reason
         (repo / path).write_text(merged)

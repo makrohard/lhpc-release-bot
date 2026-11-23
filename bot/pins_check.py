@@ -218,8 +218,10 @@ def governed(manifest_text: str) -> list:
             runtime = [RUNTIME_SRC.match(a)["path"] for s in steps for a in _pip_install(s)
                        if RUNTIME_SRC.match(a)]
             for argv in steps:
-                i = argv.index("-c") + 1 if "-c" in argv else 0
-                m = CONSTRAINTS.match(argv[i]) if 0 < i < len(argv) else None
+                # every `-c`, not the first: MeshChat's step names the node's wheel constraint
+                # (`.venv/...`) before its own file, and reading only the first hid the step
+                m = next((CONSTRAINTS.match(argv[i + 1]) for i, tok in enumerate(argv[:-1])
+                          if tok in ("-c", "--constraint") and CONSTRAINTS.match(argv[i + 1])), None)
                 args = _pip_install(argv)
                 if not m or not args:
                     continue

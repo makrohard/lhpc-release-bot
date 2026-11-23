@@ -57,6 +57,16 @@ id = "meshcore"
     remote = "https://example.invalid/core.git"
 
   [[stack.component]]
+  id = "chat"
+    build_steps = [
+      {{ argv = [".venv/bin/pip", "install", "-c", ".venv/lhpc-rns-constraint.txt", "-c", "{{asset}}/chat-constraints.txt", "aiohttp", "rns"] }},
+    ]
+    [stack.component.source]
+    path = "src/chat"
+    pin_commit = "{a}"
+    remote = "https://example.invalid/chat.git"
+
+  [[stack.component]]
   id = "repeater-src"
     [stack.component.source]
     path = "src/repeater"
@@ -90,6 +100,8 @@ def test_the_governed_checkouts_are_read_from_the_manifest():
         # installs from {runtime}/src (the repeater, `--no-deps` beside it)
         ("node", "src/core", "", ("pyyaml", "psutil"), "repeater-constraints.txt"),
         ("node", "src/repeater", "", ("pyyaml", "psutil"), "repeater-constraints.txt"),
+        # its own file is the SECOND `-c` (the first holds pip to the node's wheel): still governed
+        ("chat", "src/chat", "", ("aiohttp", "rns"), "chat-constraints.txt"),
     }
 
 

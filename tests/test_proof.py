@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+from bot import cli
 from bot.attempt import Attempt
 from bot.cli import (
     LANE_JOB,
@@ -809,3 +810,10 @@ def test_a_gate_report_that_cannot_read_its_jobs_never_stops_prove():
     with pytest.raises(cli.Stop) as stop:
         cli.stage_prove(ctx)
     assert "the candidate is not proven" in stop.value.observed
+
+
+def test_the_ci_wait_outlasts_the_ceiling_of_the_ci_it_waits_for():
+    # LHPC ci.yml: the test job's timeout-minutes is 60. A bound below it calls a green CI that is
+    # still running "not finished" (R2 of the rehearsal: CI 49 min against a 40 min bound).
+    assert cli.LHPC_CI_JOB_CEILING_S == 60 * 60
+    assert cli.BOUNDS["ci"] > cli.LHPC_CI_JOB_CEILING_S
