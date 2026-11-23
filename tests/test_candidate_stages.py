@@ -7,6 +7,7 @@ attempt's base. The upstream scan, LHPC's pin contract and its Python checks are
 whether a candidate exists, not how its commits are shaped. Real git, a real bare origin."""
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -63,6 +64,7 @@ class _Ctx:
         self.origin, self.work, self.mode, self.version = origin, work, mode, ""
         self.gh = self.bot_gh = self
         self.att, self.prs, self.dispatched, self.summaries = att, [], [], []
+        self.bodies = []
 
     # Ctx
     def clone(self, repo, ref="", token=""):
@@ -116,6 +118,7 @@ class _Ctx:
 
     def pull_request(self, repo, head, base, title, body):
         self.prs.append((head, base))
+        self.bodies.append(body)
         return {"number": 41}
 
 
@@ -150,6 +153,119 @@ def test_stage_plan_pushes_the_moves_then_the_changelog_section_alone(planned, o
     top = git("show", f"{cand}:CHANGELOG.md", cwd=origin).split("## ")[1]
     assert top.startswith("0.3.7") and top.count("\n- ") == len(MOVES)
     assert [ref for _, ref in planned.dispatched] == [att.branch]      # LHPC CI, on the candidate
+
+
+def _dev_moves(origin, tmp_path, att, files):
+    """dev moves on (one commit of `files`), then the release stands on main."""
+    side = tmp_path / "side"
+    git("clone", "-q", str(origin), str(side), cwd=tmp_path)
+    git("config", "user.email", "t@example.invalid", cwd=side)
+    git("config", "user.name", "t", cwd=side)
+    git("checkout", "-q", "dev", cwd=side)
+    for name, text in files.items():
+        write(side, name, text)
+    git("add", "-A", cwd=side)
+    git("commit", "-q", "-m", "a dev commit", cwd=side)
+    git("push", "-q", "origin", "dev", "--force", cwd=side)
+    git("push", "-q", "origin", f"{att.candidate_sha}:refs/heads/main", "--force", cwd=side)
+
+
+def _integrate(origin, tmp_path, att):
+    work = tmp_path / "integrate"
+    work.mkdir()
+    ctx = _Ctx(origin, work, att=Attempt(**{**att.__dict__, "state": "released"}))
+    assert cli.stage_integrate(ctx) == 0
+    return ctx
+
+
+def _section(text, version):
+    lines = text.split("\n")
+    start = lines.index(f"## {version}")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    return "\n".join(lines[start:end]).strip()
+
+
+DEV_LOGS = {   # merge_back's two inserting paths: before the first older heading, or after every heading
+    "inserted-before-an-older-heading-dev-at-the-release": None,
+    "inserted-before-an-older-heading-dev-opened-0.4.0":
+        "# Changelog\n\n## 0.4.0\n\n- dev's next cycle\n\n## 0.3.6\n\n- the released one\n",
+    "appended-after-every-heading": "# Changelog\n\n## 0.4.0\n\n- dev's next cycle\n",
+}
+
+
+@pytest.mark.parametrize("dev_log", list(DEV_LOGS.values()), ids=list(DEV_LOGS))
+def test_the_merge_back_is_the_moves_then_the_released_section_alone(planned, origin, tmp_path, dev_log):
+    """LHPC caps CHANGELOG bullets at two per commit and exempts a CHANGELOG-alone commit that copies the released
+    section whole, wherever it sits: the merge-back PR is (1') everything but CHANGELOG, then (2') CHANGELOG alone,
+    adding only the `## <v>` section, as the candidate has it. Red before: one commit with both."""
+    att = planned.att
+    _dev_moves(origin, tmp_path, att, {"notes.txt": "dev moved on\n", **({"CHANGELOG.md": dev_log} if dev_log else {})})
+    _integrate(origin, tmp_path, att)
+    head = git("rev-parse", f"refs/heads/integrate/{att.version}", cwd=origin)
+    one, two = git("rev-list", "--reverse", f"refs/heads/dev..{head}", cwd=origin).split()
+    assert "CHANGELOG.md" not in git("diff", "--name-only", f"{one}^", one, cwd=origin).split()
+    assert git("diff", "--name-only", one, two, cwd=origin) == "CHANGELOG.md"
+    diff = git("diff", "-U0", one, two, cwd=origin).split("\n")
+    assert not [ln for ln in diff if ln.startswith("-") and not ln.startswith("---")]
+    added = "\n".join(ln[1:] for ln in diff if ln.startswith("+") and not ln.startswith("+++")).strip()
+    assert added == _section(git("show", f"{att.candidate_sha}:CHANGELOG.md", cwd=origin), att.version)
+    assert git("log", "-1", "--format=%s", two, cwd=origin) == f"{att.version}: changelog (released from main)"
+
+
+def test_a_dev_that_has_the_moves_and_a_newer_cycle_gets_the_released_section_alone(planned, origin, tmp_path):
+    """Nothing but CHANGELOG differs (dev's scalars win for its newer cycle): no empty (1'), the branch is (2')
+    alone and the pull request opens. Red before: `git commit` of the empty (1') raised, no pull request."""
+    att = planned.att
+    files = {name: git("show", f"{att.candidate_sha}:{name}", cwd=origin) + "\n"
+             for name in git("diff", "--name-only", att.base_sha, att.candidate_sha, cwd=origin).split()
+             if name != "CHANGELOG.md"}
+    for name in files:
+        if name.endswith(("pyproject.toml", "version.py")):
+            files[name] = re.sub(r'(?i)(version\w* = )"[^"]+"', r'\1"0.4.0"', files[name], count=1)
+    log = git("show", f"{att.base_sha}:CHANGELOG.md", cwd=origin)
+    files["CHANGELOG.md"] = re.sub(r"^## ", "## 0.4.0\n\n- next\n\n## ", log, count=1, flags=re.M) + "\n"
+    _dev_moves(origin, tmp_path, att, files)
+    ctx = _integrate(origin, tmp_path, att)
+    head = git("rev-parse", f"refs/heads/integrate/{att.version}", cwd=origin)
+    assert git("rev-list", f"refs/heads/dev..{head}", cwd=origin).split() == [head]
+    assert git("diff", "--name-only", f"{head}^", head, cwd=origin) == "CHANGELOG.md"
+    assert ctx.prs == [(f"integrate/{att.version}", "dev")]
+
+
+def test_a_dev_that_already_carries_the_whole_release_needs_no_pull_request(planned, origin, tmp_path):
+    """dev has the moves, its own newer cycle's scalars and the released section: nothing is brought back, the stage
+    says so and opens no pull request (GitHub refuses one without a commit). Red before: the empty branch went to
+    `pull_request`."""
+    att = planned.att
+    files = {name: git("show", f"{att.candidate_sha}:{name}", cwd=origin) + "\n"
+             for name in git("diff", "--name-only", att.base_sha, att.candidate_sha, cwd=origin).split()}
+    for name in files:
+        if name.endswith(("pyproject.toml", "version.py")):
+            files[name] = re.sub(r'(?i)(version\w* = )"[^"]+"', r'\1"0.4.0"', files[name], count=1)
+    files["CHANGELOG.md"] = re.sub(r"^## ", "## 0.4.0\n\n- next\n\n## ", files["CHANGELOG.md"], count=1, flags=re.M)
+    _dev_moves(origin, tmp_path, att, files)
+    ctx = _integrate(origin, tmp_path, att)
+    assert ctx.prs == []
+    assert ctx.att.integration == "already-on-dev" and ctx.att.state == "integrated"
+
+
+def test_the_merge_back_pull_request_says_fast_forward_not_squash(planned, origin, tmp_path):
+    att = planned.att
+    _dev_moves(origin, tmp_path, att, {"notes.txt": "dev moved on\n"})
+    ctx = _integrate(origin, tmp_path, att)
+    assert "as a fast-forward" in ctx.bodies[0] and ":refs/heads/dev" in ctx.bodies[0]
+    assert "Do not use GitHub's merge buttons" in ctx.bodies[0] and "Squash-merge" not in ctx.bodies[0]
+    assert "squash and merge commit, not rebase" in ctx.bodies[0] and "linear history" in ctx.bodies[0]
+
+
+def test_a_dev_that_has_the_released_section_gets_the_moves_alone(planned, origin, tmp_path):
+    att = planned.att
+    released = git("show", f"{att.candidate_sha}:CHANGELOG.md", cwd=origin)
+    _dev_moves(origin, tmp_path, att, {"notes.txt": "dev moved on\n", "CHANGELOG.md": released})
+    ctx = _integrate(origin, tmp_path, att)
+    head = git("rev-parse", f"refs/heads/integrate/{att.version}", cwd=origin)
+    assert len(git("rev-list", f"refs/heads/dev..{head}", cwd=origin).split()) == 1
+    assert "unchanged" in ctx.bodies[0]
 
 
 def test_stage_integrate_brings_the_whole_release_to_a_dev_that_moved_on(planned, origin, tmp_path):

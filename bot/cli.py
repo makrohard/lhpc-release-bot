@@ -1825,14 +1825,39 @@ def stage_integrate(ctx: Ctx) -> int:
         ctx.summary(f"`dev` diverged — pull request #{pr['number']} opened.")
         return 0
 
+    # Two commits, as the candidate is: LHPC caps CHANGELOG bullets at two per commit and exempts only a
+    # CHANGELOG-alone commit that copies a released section whole, so the moves and the scalars go first and the
+    # released section, placed by `merge_back`, follows on its own (none when dev already had it).
+    placed = (lhpc / "CHANGELOG.md").read_text()
+    git("checkout", "-q", "origin/dev", "--", "CHANGELOG.md", cwd=lhpc)
     git("add", "-A", cwd=lhpc)
-    git("commit", "-q", "-m", f"{att.version} (released from main)", cwd=lhpc)
+    # a dev that already carries the moves (and keeps its newer cycle's scalars) leaves nothing for (1')
+    if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=lhpc, check=False).returncode:
+        git("commit", "-q", "-m", f"{att.version} (released from main)", cwd=lhpc)
+    # compared stripped, as `resolved` reports it: merge_back's trailing-newline normalisation alone is no change
+    if placed.strip() != (lhpc / "CHANGELOG.md").read_text().strip():
+        (lhpc / "CHANGELOG.md").write_text(placed)
+        git("add", "CHANGELOG.md", cwd=lhpc)
+        git("commit", "-q", "-m", f"{att.version}: changelog (released from main)", cwd=lhpc)
+    if git("rev-parse", "HEAD", cwd=lhpc) == git("rev-parse", "origin/dev", cwd=lhpc):
+        # dev already carries the moves and the section: nothing to bring back, and GitHub refuses a pull
+        # request without a commit
+        att.state = "integrated" if att.state == "released" else att.state
+        att.integration = "already-on-dev"
+        att.notes.append("dev already carries the release's changes; nothing merged back")
+        ctx.save_attempt(number, att)
+        ctx.summary("`dev` already carries the release's changes — nothing to merge back.")
+        return 0
     git("push", "-q", "-f", "origin", f"HEAD:refs/heads/{branch}", cwd=lhpc)
     pr = ctx.gh.pull_request(
         LHPC, branch, "dev", f"Bring {att.version} back to dev",
         f"`{att.version}` was released from `main`. Version scalars and changelog placement "
         f"were resolved automatically ({', '.join(resolved) or 'nothing to resolve'}); "
-        f"everything else is the release commit unchanged. Squash-merge when the checks are green.")
+        f"everything else is the release commit unchanged.\n\nLand it by hand once its checks are green: "
+        f"push this branch's head to `dev` as a fast-forward (`git push origin "
+        f"<head sha>:refs/heads/dev`). Do not use GitHub's merge buttons (this repository offers squash "
+        f"and merge commit, not rebase): a squash puts the changelog and the moves in one commit, which "
+        f"LHPC's house rules refuse, and a merge commit breaks `dev`'s required linear history.")
     att.state = "integrated" if att.state == "released" else att.state
     att.integration = f"pr:{pr['number']}"
     att.notes.append(f"dev diverged; PR #{pr['number']} opened")
