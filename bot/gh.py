@@ -43,6 +43,9 @@ MAX_RETRY_AFTER = 60
 # `RUN_VISIBLE_POLL_S` for at most `RUN_VISIBLE_S`; a 404 after that is the answer and raises.
 RUN_VISIBLE_S = 180.0
 RUN_VISIBLE_POLL_S = 5.0
+# The runs LIST lags the same way: a run started moments ago may be missing from it. An empty
+# answer that must mean "nothing is running" is read again every `LIST_RECHECK_S`.
+LIST_RECHECK_S = 30.0
 
 
 class GitHubError(RuntimeError):
@@ -517,7 +520,7 @@ class GitHub:
     # Every issue this bot writes is a public page, and its bodies quote diagnostics that were
     # produced somewhere else — a git error, a traceback, an API message. Scrubbing at THIS
     # boundary means a new caller cannot forget to do it.
-    def unfinished_runs(self, repo: str, workflow: str) -> list:
+    def unfinished_runs(self, repo: str, workflow: str, confirm_s: float = 0.0) -> list:
         """Runs of one workflow that have not finished. Answers the only question that can settle
         a dispatch whose run id was never recorded: is anything still writing?
 
@@ -525,13 +528,21 @@ class GitHub:
         the build matrix is `max-parallel: 1`, so a second stack waits its turn — and calling a
         publisher that has not started yet "settled" is exactly the conclusion that loses a
         release.
+
+        With `confirm_s`, an empty answer counts only when it stays empty on re-reads every
+        `LIST_RECHECK_S` for that long: a run started moments ago may not be listed yet.
         """
-        out = []
-        for status in ("queued", "in_progress", "waiting", "requested", "pending"):
-            got = self.get(f"/repos/{repo}/actions/workflows/{workflow}/runs"
-                           f"?status={status}&per_page=100")
-            out.extend(got.get("workflow_runs") or [])
-        return out
+        end = time.monotonic() + max(confirm_s, 0.0)
+        while True:
+            out = []
+            for status in ("queued", "in_progress", "waiting", "requested", "pending"):
+                got = self.get(f"/repos/{repo}/actions/workflows/{workflow}/runs"
+                               f"?status={status}&per_page=100")
+                out.extend(got.get("workflow_runs") or [])
+            left = end - time.monotonic()
+            if out or left <= 0:
+                return out
+            time.sleep(min(LIST_RECHECK_S, left))
 
     def create_issue(self, repo: str, title: str, body: str, labels) -> dict:
         return self.request("POST", f"/repos/{repo}/issues",

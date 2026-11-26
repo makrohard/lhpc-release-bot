@@ -38,7 +38,7 @@ from .attempt import (
     record_of_labelled_issue,
     recovery_decision,
 )
-from .gh import GitHub, GitHubError
+from .gh import RUN_VISIBLE_S, GitHub, GitHubError
 from .redaction import scrub
 
 LHPC = "makrohard/loraham-pi-control"
@@ -2026,7 +2026,12 @@ def stage_image(ctx: Ctx) -> int:
             ctx.save_attempt(number, att)
             ctx.summary(f"\nImage `{tag}` was already published.")
             return 0
-        busy = ctx.gh.unfinished_runs(IMG, IMAGE_WORKFLOW)
+        # The recorded run is asked by its id. A builder started just before a lost checkpoint
+        # may not be listed yet, so "none running" has to hold for the list's lag as well.
+        recorded = att.runs.get("image")
+        last = ctx.gh.dispatched_run(IMG, int(recorded["id"])) if recorded else {}
+        busy = ([last] if last and last.get("status") != "completed" else
+                ctx.gh.unfinished_runs(IMG, IMAGE_WORKFLOW, confirm_s=RUN_VISIBLE_S))
         if busy:
             raise Stop("image", f"an image build is still running while {tag} is incomplete.",
                        "Wait for it and re-run `finish`. A second builder on the same tag would "
