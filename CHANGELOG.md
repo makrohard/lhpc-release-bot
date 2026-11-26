@@ -4,6 +4,8 @@ Milestones only.
 
 ## Unreleased
 
+- src/reticulum, src/lxmf and src/nomadnet are no longer held: the controller now stops RNS 1.6.1
+  (LHPC testlab release-verify 45779297917, 18/18, on cons/c1-rns161-r4).
 - A GitHub rate limit no longer ends a stage: the call (any method; a rate-limited reply wrote
   nothing) waits for its `Retry-After`, else (quota spent) its `X-RateLimit-Reset` but at least
   60 s, else 60 s, logs the wait and tries again, up to 65 min of waits per call; a 403 whose
