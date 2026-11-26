@@ -438,7 +438,7 @@ def _dispatch_finish(ctx: Ctx, number: int, att: Attempt) -> None:
                    f"Check run {claimant}. If it started no `finish`, dispatch `finish` with "
                    f"attempt {att.run_id} by hand; if it did, wait for that run.")
     if att.finish_run:
-        run = ctx.bot_gh.run(BOT, int(att.finish_run))
+        run = ctx.bot_gh.dispatched_run(BOT, int(att.finish_run))
         if run.get("status") != "completed":
             ctx.summary(f"\nfinish run {att.finish_run} for attempt {att.run_id} is in flight.")
             return

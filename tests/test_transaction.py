@@ -759,3 +759,63 @@ def test_an_unrecorded_dispatch_is_never_settled_even_with_no_build_running():
         _recover(ctx)
     assert "meshtastic dispatched with no recorded run" in stop.value.observed
     assert ctx.dispatches == [] and ctx.att.state == "mutated" and ctx.closed == []
+
+
+class _LaggingGitHub:
+    """GitHub's real `wait` over the recovery fake's runs, reached through the real `run` and the
+    HTTP layer: the rollback run (900) answers 404 for its first `lag` reads, as GitHub does for
+    a run its dispatch reply has just named. Every other call is the recovery fake's."""
+
+    def __new__(cls, ctx, lag):
+        from bot import gh as ghmod
+
+        class Lagging(ghmod.GitHub):
+            def request(self, method, path, body=None, accept="application/vnd.github+json"):
+                repo, _, run_id = path.removeprefix("/repos/").rpartition("/actions/runs/")
+                assert method == "GET" and run_id.isdigit(), path
+                self.reads.append(int(run_id))
+                if int(run_id) == 900 and self.lag:
+                    self.lag -= 1
+                    raise ghmod.GitHubError(f"GET {path} -> 404: Not Found", status=404)
+                return ctx.wait(repo, int(run_id), 0, rerun=False)
+
+        gh = Lagging("t")
+        gh.lag, gh.reads = lag, []
+        for name in dir(ctx):
+            if (not name.startswith("_") and name not in ("wait", "run", "request")
+                    and callable(getattr(ghmod.GitHub, name, None))):
+                setattr(gh, name, getattr(ctx, name))
+        return gh
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    from bot import gh as ghmod
+    now = [0.0]
+    monkeypatch.setattr(ghmod.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(ghmod.time, "sleep", lambda s: now.__setitem__(0, now[0] + s))
+    return now
+
+
+def test_a_withdraw_run_not_yet_readable_after_its_dispatch_is_waited_for(clock):
+    """GitHub names the run in the dispatch reply before its run endpoint knows it: the first
+    reads 404. That lag is waited out; the withdrawal is judged and the attempt closes."""
+    old, mine = v3entry("8"), _own()
+    ctx = _RecoverCtx(fragment=core(mine), live=[mine, old], snapshot=[old])
+    ctx.gh = _LaggingGitHub(ctx, lag=3)
+    assert _recover(ctx) == 0
+    assert ctx.gh.reads.count(900) == 4 and ctx.att.state == "restored"
+    assert ctx.closed == ["closed"]
+
+
+def test_a_withdraw_run_that_stays_unknown_fails_naming_it_and_keeps_the_attempt_open(clock):
+    """The wait for the run to appear is bounded: a 404 past it is real and ends the stage,
+    naming the run; nothing is closed."""
+    from bot import gh as ghmod
+    old, mine = v3entry("8"), _own()
+    ctx = _RecoverCtx(fragment=core(mine), live=[mine, old], snapshot=[old])
+    ctx.gh = _LaggingGitHub(ctx, lag=10**6)
+    with pytest.raises(ghmod.GitHubError, match="run 900 of .* still unknown") as err:
+        _recover(ctx)
+    assert err.value.status == 404 and clock[0] == ghmod.RUN_VISIBLE_S
+    assert ctx.att.state == "mutated" and ctx.closed == []

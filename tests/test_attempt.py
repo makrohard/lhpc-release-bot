@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import pytest
 
+from bot import gh as ghmod
 from bot.attempt import Attempt, Unreadable, blocks_new_release, recovery_decision
+from bot.gh import GitHubError
 
 CAND, OTHER = "c" * 40, "9" * 40
 ENTRY = {"sha256": "a" * 64, "filename": "meshtastic-x.tar.zst"}
@@ -194,7 +196,13 @@ class _PlanCtx:
         return {}
 
     def run(self, repo, run_id):
+        if self._finish.get("lag"):
+            self._finish["lag"] -= 1
+            raise GitHubError(f"GET /repos/{repo}/actions/runs/{run_id} -> 404", status=404)
         return dict(self._finish, id=run_id)
+
+    def dispatched_run(self, repo, run_id):
+        return ghmod.GitHub.dispatched_run(self, repo, run_id)     # the real wait for it
 
     def dispatch(self, repo, workflow, ref, inputs=None):
         self.sent.append(inputs)
@@ -237,6 +245,15 @@ def test_a_finish_run_that_ended_with_the_attempt_still_owing_stops(conclusion):
     with pytest.raises(cli.Stop) as stop:
         cli.stage_plan(ctx)
     assert ctx.sent == [] and "8123" in stop.value.observed and conclusion in stop.value.observed
+
+
+def test_a_finish_run_not_yet_readable_is_waited_for_not_an_error(monkeypatch):
+    """The finish run's id came from its dispatch reply; GitHub may 404 it for a while after."""
+    from bot import cli
+    monkeypatch.setattr(ghmod.time, "sleep", lambda s: None)
+    ctx = _PlanCtx(_owing(finish_run="8123"), finish={"status": "in_progress", "lag": 2})
+    assert cli.stage_plan(ctx) == 0
+    assert ctx.sent == [] and "8123" in ctx.summaries[-1] and "in flight" in ctx.summaries[-1]
 
 
 def test_a_refused_finish_dispatch_releases_its_claim():

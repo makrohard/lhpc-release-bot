@@ -38,6 +38,11 @@ MAX_RERUNS = 5
 # hide a write that happened. A `Retry-After` up to the cap is waited instead; a longer one raises.
 GET_RETRY_WAITS = (5, 15, 45)
 MAX_RETRY_AFTER = 60
+# A dispatch reply names its run before the run endpoint knows it: a 404 on the first reads of a
+# just-dispatched run is that lag, not absence. Such reads are tried again every
+# `RUN_VISIBLE_POLL_S` for at most `RUN_VISIBLE_S`; a 404 after that is the answer and raises.
+RUN_VISIBLE_S = 180.0
+RUN_VISIBLE_POLL_S = 5.0
 
 
 class GitHubError(RuntimeError):
@@ -185,6 +190,24 @@ class GitHub:
     def run(self, repo: str, run_id: int) -> dict:
         return self.get(f"/repos/{repo}/actions/runs/{run_id}")
 
+    def dispatched_run(self, repo: str, run_id: int, grace_s: float = RUN_VISIBLE_S) -> dict:
+        """The run read as one this bot dispatched: a 404 is waited out for at most `grace_s`
+        (see `RUN_VISIBLE_S`); a 404 after that raises and names the run. Every other error
+        raises as `run` raises it."""
+        end = time.monotonic() + max(grace_s, 0.0)
+        while True:
+            try:
+                return self.run(repo, run_id)
+            except GitHubError as exc:
+                if exc.status != 404:
+                    raise
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise GitHubError(f"run {run_id} of {repo} is still unknown to GitHub "
+                                      f"{grace_s:.0f}s after its dispatch: {exc}",
+                                      status=404) from exc
+            time.sleep(min(RUN_VISIBLE_POLL_S, left))
+
     def jobs(self, repo: str, run_id: int, attempt: int = 0) -> list:
         """The jobs of ONE attempt. Without the attempt the endpoint returns the latest, so a
         re-run of the same run would answer for a different execution than the one recorded."""
@@ -233,11 +256,15 @@ class GitHub:
         judged. The returned run carries `rerun` (the last re-run: the attempt re-run and its
         jobs) and `reruns` (each, with its reason); when the last attempt still failed only on
         an external transfer, `external_unresolved` names the jobs.
-        `rerun=False` for runs that are being settled, not judged."""
+        `rerun=False` for runs that are being settled, not judged.
+        Until the run has been read once, a 404 is the lag after its dispatch
+        (`dispatched_run`), waited out within the same bound."""
         start = time.monotonic()
-        deadline, attempt_start, reruns = start + timeout_s, start, []
+        deadline, attempt_start, reruns, seen = start + timeout_s, start, [], False
         while True:
-            run = self.run(repo, run_id)
+            run = (self.run(repo, run_id) if seen else
+                   self.dispatched_run(repo, run_id, min(RUN_VISIBLE_S, timeout_s)))
+            seen = True
             if reruns:
                 run["rerun"] = {"attempt": reruns[-1]["attempt"], "jobs": reruns[-1]["jobs"]}
                 run["reruns"] = [dict(r) for r in reruns]
