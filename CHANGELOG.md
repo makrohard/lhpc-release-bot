@@ -4,6 +4,9 @@ Milestones only.
 
 ## Unreleased
 
+- A run the bot has just started is waited for while GitHub does not know it yet: a 404 on its
+  id (up to 3 min) no longer ends the stage, and a builder missing from the runs list no longer
+  starts a second image build on the same tag. A 404 past that window still fails, naming the run.
 - A run blocked by an unresolved attempt recovers the oldest one itself; one that cannot be settled
   provably (e.g. an unrecorded publisher) stays open, so the scheduled run stays red until settled.
 - A recovery that stops the same way again (every scheduled run re-recovers a blocked attempt)
