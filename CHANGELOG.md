@@ -4,6 +4,10 @@ Milestones only.
 
 ## Unreleased
 
+- A GitHub rate limit no longer ends a stage: the call (any method; a rate-limited reply wrote
+  nothing) waits for its `Retry-After`, else (quota spent) its `X-RateLimit-Reset` but at least
+  60 s, else 60 s, logs the wait and tries again, up to 65 min of waits per call; a 403 whose
+  body says "rate limit" counts too.
 - A run the bot has just started is waited for while GitHub does not know it yet: a 404 on its
   id (up to 3 min) no longer ends the stage, and a builder missing from the runs list no longer
   starts a second image build on the same tag. A 404 past that window still fails, naming the run.

@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -33,11 +34,16 @@ EXTERNAL_WAITS = (0, 60, 120, 300, 600)
 MAX_RERUNS = 5
 
 
-# A GET that failed on something passing (a 5xx, a rate limit, the network, a cut or garbled
-# reply) is tried again after these waits; POST/PATCH/DELETE never are, because a lost reply may
-# hide a write that happened. A `Retry-After` up to the cap is waited instead; a longer one raises.
+# A GET that failed on something passing (a 5xx, the network, a cut or garbled reply) is tried
+# again after these waits; POST/PATCH/DELETE never are, because a lost reply may hide a write
+# that happened.
 GET_RETRY_WAITS = (5, 15, 45)
-MAX_RETRY_AFTER = 60
+# A rate limit is a refusal (nothing was done), so any method is sent again once it is over: after
+# its `Retry-After`, else at its `X-RateLimit-Reset`, else after `RATE_LIMIT_FALLBACK_S`. The waits
+# on one call add up to at most `RATE_LIMIT_BUDGET_S` (an hourly quota resets within the hour); a
+# wait that would pass it raises the rate-limited error instead.
+RATE_LIMIT_FALLBACK_S = 60
+RATE_LIMIT_BUDGET_S = 65 * 60
 # A dispatch reply names its run before the run endpoint knows it: a 404 on the first reads of a
 # just-dispatched run is that lag, not absence. Such reads are tried again every
 # `RUN_VISIBLE_POLL_S` for at most `RUN_VISIBLE_S`; a 404 after that is the answer and raises.
@@ -57,27 +63,40 @@ class GitHubError(RuntimeError):
         self.rate_limited, self.status = rate_limited, status
 
 
-def rate_limited(code: int, headers) -> bool:
-    """The one answer to "is this a rate limit?": a 429, or a 403 that says so in its headers.
-    Any other 403 is a permission the token does not have, and waiting will not give it one."""
+def rate_limited(code: int, headers, detail: str = "") -> bool:
+    """The one answer to "is this a rate limit?": a 429, or a 403 that says so in its headers or
+    its body. Any other 403 is a permission the token does not have, and waiting will not give
+    it one."""
     if code == 429:
         return True
-    return code == 403 and headers is not None and (
-        headers.get("x-ratelimit-remaining") == "0" or headers.get("retry-after") is not None)
+    return code == 403 and ("rate limit" in detail.lower() or headers is not None and (
+        headers.get("x-ratelimit-remaining") == "0" or headers.get("retry-after") is not None))
 
 
-def _retry_wait(code: int, headers, limited: bool, tried: int):
-    """Seconds to wait before trying a failed GET again, or None: do not."""
-    if not (code >= 500 or limited) or tried >= len(GET_RETRY_WAITS):
-        return None
+def _rate_limit_wait(headers):
+    """Seconds until a rate limit is over, as the reply says; None when it says nonsense. The
+    reset only counts when the quota is spent (`remaining` 0): a secondary limit carries the
+    primary quota's reset, which says nothing about it. A reset never shortens the wait below
+    the fallback, so a reset already past (clock skew) is not hammered at once."""
     after = headers.get("retry-after") if headers is not None else None
-    if after is None:
-        return GET_RETRY_WAITS[tried]
+    spent = headers is not None and headers.get("x-ratelimit-remaining") == "0"
+    reset = headers.get("x-ratelimit-reset") if spent else None
     try:
-        seconds = int(after)
+        if after is not None:
+            return max(int(after), 1)
+        if reset is not None:
+            return max(int(int(reset) - time.time()) + 1, RATE_LIMIT_FALLBACK_S)
     except ValueError:
         return None
-    return seconds if 0 <= seconds <= MAX_RETRY_AFTER else None
+    return RATE_LIMIT_FALLBACK_S
+
+
+def _retry_wait(code: int, tried: int):
+    """Seconds to wait before trying a GET that failed on something other than a rate limit
+    again, or None: do not."""
+    if code < 500 or tried >= len(GET_RETRY_WAITS):
+        return None
+    return GET_RETRY_WAITS[tried]
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -98,7 +117,7 @@ class GitHub:
     def request(self, method: str, path: str, body=None, accept="application/vnd.github+json"):
         url = path if path.startswith("http") else f"{self._api}{path}"
         data = json.dumps(body).encode() if body is not None else None
-        tried = 0
+        tried, limit_waited = 0, 0
         while True:
             req = urllib.request.Request(url, data=data, method=method, headers={
                 "Authorization": f"Bearer {self._token}", "Accept": accept,
@@ -113,9 +132,18 @@ class GitHub:
                     detail = exc.read().decode("utf-8", "replace")[:400]
                 except (OSError, http.client.HTTPException):
                     detail = "(body unreadable)"    # the status still decides the retry
-                limited = rate_limited(exc.code, exc.headers)
+                limited = rate_limited(exc.code, exc.headers, detail)
                 error = GitHubError(f"{method} {url} -> {exc.code}: {detail}", limited, exc.code)
-                wait = _retry_wait(exc.code, exc.headers, limited, tried)
+                if limited:
+                    wait = _rate_limit_wait(exc.headers)
+                    if wait is None or limit_waited + wait > RATE_LIMIT_BUDGET_S:
+                        raise error from None
+                    limit_waited += wait
+                    print(f"rate limit on {method} {url}: waiting {wait} s "
+                          f"({limit_waited} of {RATE_LIMIT_BUDGET_S} s)", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                wait = _retry_wait(exc.code, tried)
             except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
                 # The network, a reply cut short (`IncompleteRead`) or one that is not JSON.
                 error = GitHubError(f"{method} {url} -> {exc}")

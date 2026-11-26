@@ -62,7 +62,7 @@ OK = json.dumps({"status": "ahead"}).encode()
 
 
 @pytest.mark.parametrize("failure,slept", [
-    (_http(500), 5), (_http(502), 5), (_http(429), 5), (_http(403, x_ratelimit_remaining="0"), 5),
+    (_http(500), 5), (_http(502), 5), (_http(429), 60), (_http(403, x_ratelimit_remaining="0"), 60),
     (_http(403, retry_after="30"), 30), (urllib.error.URLError("timed out"), 5),
     (http.client.IncompleteRead(b"{"), 5), (b"<html>not json</html>", 5)],
     ids=["500", "502", "429", "403-remaining-0", "403-retry-after", "network",
@@ -103,18 +103,81 @@ def test_a_get_refused_for_good_raises_at_once(api, failure):
     assert api["calls"] == ["GET"] and api["slept"] == []
 
 
-def test_a_retry_after_beyond_the_cap_raises_without_waiting(api):
-    api["script"] = [_http(429, retry_after="120")]
-    with pytest.raises(GitHubError):
+NOW = 1_800_000_000.0
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    monkeypatch.setattr(gh.time, "time", lambda: NOW)
+
+
+def test_a_primary_rate_limit_waits_until_its_reset_then_tries_again(api, clock, capsys):
+    """Run 45733062517 died in prove and in recover on a spent hourly quota: three short waits
+    end long before the reset. The reset the reply names is waited for, and the wait is logged."""
+    spent = _http(403, x_ratelimit_remaining="0", x_ratelimit_reset=str(int(NOW) + 1800))
+    api["script"] = [spent, OK]
+    assert GitHub("t").get("/repos/o/r/x") == {"status": "ahead"}
+    assert api["calls"] == ["GET", "GET"] and api["slept"] == [1801]
+    assert "rate limit" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("headers", [
+    {"x_ratelimit_remaining": "0", "x_ratelimit_reset": str(int(NOW) - 30)},
+    {"x_ratelimit_remaining": "0", "x_ratelimit_reset": str(int(NOW) + 2)},
+    {"x_ratelimit_remaining": "4000", "x_ratelimit_reset": str(int(NOW) + 3000)}],
+    ids=["reset-past", "reset-soon", "secondary-with-primary-reset"])
+def test_a_reset_counts_only_for_a_spent_quota_and_never_below_the_fallback(api, clock, headers):
+    """A past or imminent reset is not a reason to send again within seconds (thousands of tries
+    in the budget); a secondary limit's headers name the primary quota's reset, not its own."""
+    body = b"You have exceeded a secondary rate limit."
+    api["script"] = [_http(403, body=body, **headers), OK]
+    assert GitHub("t").get("/repos/o/r/x") == {"status": "ahead"}
+    assert api["slept"] == [60]
+
+
+def test_a_retry_after_beyond_the_short_wait_is_waited(api, clock):
+    api["script"] = [_http(429, retry_after="120"), OK]
+    assert GitHub("t").get("/repos/o/r/x") == {"status": "ahead"}
+    assert api["slept"] == [120]
+
+
+def test_a_403_whose_body_says_rate_limit_is_waited_out(api, clock):
+    body = b'{"message": "API rate limit exceeded for installation ID 1."}'
+    api["script"] = [_http(403, body=body), OK]
+    assert GitHub("t").get("/repos/o/r/x") == {"status": "ahead"}
+    assert api["slept"] == [60]
+
+
+@pytest.mark.parametrize("method", ["POST", "PATCH", "DELETE"])
+def test_a_write_refused_by_a_rate_limit_is_tried_again(api, clock, method):
+    """A rate-limited reply is a refusal: nothing was written, so sending it again is safe."""
+    api["script"] = [_http(429, retry_after="30"), OK]
+    assert GitHub("t").request(method, "/repos/o/r/x", {"a": 1}) == {"status": "ahead"}
+    assert api["calls"] == [method, method] and api["slept"] == [30]
+
+
+def test_rate_limit_waits_stop_at_the_budget_then_raise(api, clock):
+    api["script"] = [_http(429, retry_after="600")] * 8
+    with pytest.raises(GitHubError) as err:
         GitHub("t").get("/repos/o/r/x")
-    assert api["calls"] == ["GET"] and api["slept"] == []
+    assert err.value.rate_limited and api["slept"] == [600] * 6     # 6 x 10 min <= 65 min
+    assert len(api["calls"]) == 7
+
+
+def test_a_reset_beyond_the_budget_raises_without_waiting(api, clock):
+    api["script"] = [_http(403, x_ratelimit_remaining="0", x_ratelimit_reset=str(int(NOW) + 7200))]
+    with pytest.raises(GitHubError) as err:
+        GitHub("t").get("/repos/o/r/x")
+    assert err.value.rate_limited and api["calls"] == ["GET"] and api["slept"] == []
 
 
 @pytest.mark.parametrize("failure,limited", [
-    (_http(429, retry_after="120"), True), (_http(403, x_ratelimit_remaining="0"), True),
+    (_http(429, retry_after="99999"), True),
+    (_http(403, x_ratelimit_remaining="0", x_ratelimit_reset=str(int(NOW) + 99999)), True),
+    (_http(403, body=b"API rate limit exceeded", retry_after="99999"), True),
     (_http(403), False), (_http(500), False)],
-    ids=["429", "403-remaining-0", "403-permission", "500"])
-def test_the_error_says_whether_it_was_a_rate_limit(api, failure, limited):
+    ids=["429", "403-remaining-0", "403-body", "403-permission", "500"])
+def test_the_error_says_whether_it_was_a_rate_limit(api, clock, failure, limited):
     """The upstream reader skips a rate-limited source for the week; any other refusal stays a
     fault. It reads that from the error, decided once, here."""
     api["script"] = [failure] * 4
